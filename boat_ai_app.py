@@ -1,6 +1,7 @@
 # boat_ai_app.py
-# 強化版 Boat Race AI v2
-# 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI 対応
+# Boat Race AI v3
+# 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI
+# 買い目点数選択対応版
 
 import math
 import itertools
@@ -15,14 +16,13 @@ import streamlit as st
 # =====================================================
 
 st.set_page_config(
-    page_title="Boat AI v2",
+    page_title="Boat AI v3",
     page_icon="🚤",
     layout="wide"
 )
 
 # =====================================================
 # DEMO DATA
-# MVP強化版
 # =====================================================
 
 def demo_racecard():
@@ -121,7 +121,7 @@ def calc_power(df):
 
         score = 0
 
-        # 枠
+        # 枠補正
         score += {
             1: 30,
             2: 18,
@@ -152,7 +152,7 @@ def calc_power(df):
         # ボート
         score += r["ボート"] * 0.3
 
-        # 4カド穴補正
+        # 4カド穴
         if r["艇"] == 4 and r["展示"] <= 6.74:
             score += 8
 
@@ -171,8 +171,7 @@ def calc_power(df):
 
 
 # =====================================================
-# ODDS
-# MVP疑似オッズ
+# 疑似オッズ
 # =====================================================
 
 def make_odds():
@@ -200,7 +199,7 @@ def make_odds():
 
 
 # =====================================================
-# COMBO AI
+# COMBO SCORE
 # =====================================================
 
 def combo_score(combo, power):
@@ -227,11 +226,11 @@ def combo_score(combo, power):
     if a == 1:
         s += 10
 
-    # 4カド穴
+    # 4カド
     if a == 4:
         s += 5
 
-    # 人気薄加点
+    # 穴補正
     if c in [4,5,6]:
         s += 3
 
@@ -240,6 +239,10 @@ def combo_score(combo, power):
 
     return round(s,1)
 
+
+# =====================================================
+# BUILD TICKETS
+# =====================================================
 
 def build_tickets(power, odds):
 
@@ -260,7 +263,6 @@ def build_tickets(power, odds):
 
         ev = ai * math.log(odd+1)
 
-        # 分類
         label = "抑え"
 
         if ai >= 95 and odd <= 20:
@@ -297,12 +299,17 @@ def build_tickets(power, odds):
 # 厳選AI
 # =====================================================
 
-def selected_tickets(df):
+def selected_tickets(df, ticket_count=10):
 
-    hot = df[df["分類"]=="熱🔥"].head(2)
-    main = df[df["分類"]=="本線"].head(4)
-    hole = df[df["分類"]=="穴"].head(3)
-    saver = df[df["分類"]=="抑え"].head(2)
+    hot_count = max(1, round(ticket_count * 0.20))
+    main_count = max(1, round(ticket_count * 0.40))
+    hole_count = max(1, round(ticket_count * 0.25))
+    saver_count = max(1, ticket_count - hot_count - main_count - hole_count)
+
+    hot = df[df["分類"]=="熱🔥"].head(hot_count)
+    main = df[df["分類"]=="本線"].head(main_count)
+    hole = df[df["分類"]=="穴"].head(hole_count)
+    saver = df[df["分類"]=="抑え"].head(saver_count)
 
     out = pd.concat([
         hot,
@@ -313,7 +320,18 @@ def selected_tickets(df):
 
     out = out.drop_duplicates("買い目")
 
-    return out.head(10)
+    if len(out) < ticket_count:
+
+        add = df[
+            ~df["買い目"].isin(out["買い目"])
+        ].head(ticket_count - len(out))
+
+        out = pd.concat([
+            out,
+            add
+        ])
+
+    return out.head(ticket_count)
 
 
 # =====================================================
@@ -346,7 +364,7 @@ def heavy_ai(df):
 # UI
 # =====================================================
 
-st.title("🚤 Boat Race AI v2")
+st.title("🚤 Boat Race AI v3")
 
 st.caption(
     "熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI"
@@ -377,10 +395,19 @@ with st.sidebar:
         value=1
     )
 
+    ticket_count = st.slider(
+        "買い目点数",
+        min_value=1,
+        max_value=20,
+        value=10,
+        step=1
+    )
+
     run = st.button(
         "AI予想開始",
         width="stretch"
     )
+
 
 # =====================================================
 # MAIN
@@ -400,7 +427,8 @@ if run:
     )
 
     selected = selected_tickets(
-        tickets
+        tickets,
+        ticket_count
     )
 
     heavy = heavy_ai(
@@ -490,7 +518,7 @@ if run:
 
     saver = tickets[
         tickets["分類"]=="抑え"
-    ].head(4)
+    ].head(5)
 
     st.markdown("## 抑え")
 
@@ -507,7 +535,7 @@ if run:
     st.markdown("## 厳選買い目")
 
     st.success(
-        "点数を絞った勝負候補"
+        f"{ticket_count}点に厳選"
     )
 
     st.dataframe(
@@ -533,7 +561,7 @@ if run:
     )
 
     # ==========================================
-    # AIコメント
+    # AI COMMENT
     # ==========================================
 
     top = power.iloc[0]["艇"]
