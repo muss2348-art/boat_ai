@@ -1,6 +1,6 @@
 # boat_ai_app.py
-# Boat Race AI v7
-# 実オッズ取得強化版
+# Boat Race AI v7.1
+# 3連単オッズ取得・復元強化版
 # 出走表 / 直前情報 / 3連単オッズ
 # 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI / 買い目点数 1〜20点
 
@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 
 
 st.set_page_config(
-    page_title="Boat AI v7",
+    page_title="Boat AI v7.1",
     page_icon="🚤",
     layout="wide"
 )
@@ -32,10 +32,6 @@ JCD_MAP = {
     "芦屋": "21", "福岡": "22", "唐津": "23", "大村": "24",
 }
 
-
-# =====================================================
-# UTILS
-# =====================================================
 
 def clean_text(x):
     if x is None:
@@ -173,6 +169,34 @@ def extract_rates_from_text(text):
     return round(national2, 2), round(local2, 2), round(motor2, 2), round(boat2, 2), avg_st
 
 
+def block_score_for_waku(block, waku):
+    if not block:
+        return -999
+
+    score = 0
+
+    if block.startswith(str(waku)):
+        score += 8
+
+    if re.search(rf"(^|\s){waku}(\s|号|$)", block):
+        score += 5
+
+    if f"table1_boatImage{waku}" in block:
+        score += 10
+
+    if re.search(r"\b(A1|A2|B1|B2)\b", block):
+        score += 3
+
+    nums = re.findall(r"\d+\.\d+", block)
+    score += min(len(nums), 12)
+
+    for other in range(1, 7):
+        if other != waku and block.startswith(str(other)):
+            score -= 5
+
+    return score
+
+
 def find_candidate_blocks(soup):
     blocks = []
 
@@ -203,34 +227,6 @@ def find_candidate_blocks(soup):
             unique.append(b)
 
     return unique
-
-
-def block_score_for_waku(block, waku):
-    if not block:
-        return -999
-
-    score = 0
-
-    if block.startswith(str(waku)):
-        score += 8
-
-    if re.search(rf"(^|\s){waku}(\s|号|$)", block):
-        score += 5
-
-    if f"table1_boatImage{waku}" in block:
-        score += 10
-
-    if re.search(r"\b(A1|A2|B1|B2)\b", block):
-        score += 3
-
-    nums = re.findall(r"\d+\.\d+", block)
-    score += min(len(nums), 12)
-
-    for other in range(1, 7):
-        if other != waku and block.startswith(str(other)):
-            score -= 5
-
-    return score
 
 
 def parse_racelist_by_tables(html):
@@ -428,51 +424,77 @@ def parse_beforeinfo(html):
 
 
 # =====================================================
-# オッズ取得 v7
+# 3連単オッズ v7.1
 # =====================================================
+
+def all_3t_combos():
+    return [f"{a}-{b}-{c}" for a, b, c in itertools.permutations([1, 2, 3, 4, 5, 6], 3)]
+
 
 def parse_odds3t(html):
     if not html:
         return pd.DataFrame()
 
-    soup = BeautifulSoup(html, "html.parser")
-
     rows = []
 
-    # パターン1：HTML全文から 1-2-3 12.3 を拾う
-    text = clean_text(soup.get_text(" "))
-    pattern = r"([1-6])\s*[-–]\s*([1-6])\s*[-–]\s*([1-6])\s+(\d+\.\d+)"
-
-    for a, b, c, odd in re.findall(pattern, text):
-        if len({a, b, c}) == 3:
-            rows.append({
-                "買い目": f"{a}-{b}-{c}",
-                "オッズ": to_float(odd),
-                "取得方式": "text"
-            })
-
-    # パターン2：tableを横断して数値配列から拾う
-    if len(rows) < 20:
-        rows.extend(parse_odds_from_tables(html))
-
-    # パターン3：HTML内のscript/生文字から 123 と odds の並びを拾う
-    if len(rows) < 20:
-        rows.extend(parse_odds_from_raw_html(html))
+    rows.extend(parse_odds_explicit_combo(html))
+    rows.extend(parse_odds_table_restore(html))
+    rows.extend(parse_odds_raw_restore(html))
 
     df = pd.DataFrame(rows)
 
     if df.empty:
         return df
 
-    df = df.drop_duplicates("買い目")
+    df["オッズ"] = pd.to_numeric(df["オッズ"], errors="coerce")
+    df = df.dropna(subset=["オッズ"])
     df = df[(df["オッズ"] > 0) & (df["オッズ"] < 9999)]
+
+    # 同じ買い目が複数あったら、現実的に低すぎない最初の値を優先
+    df = df.sort_values(["買い目", "取得優先"], ascending=[True, True])
+    df = df.drop_duplicates("買い目", keep="first")
+
     df = df.sort_values("オッズ", ascending=True).reset_index(drop=True)
     df["人気順"] = range(1, len(df) + 1)
 
     return df
 
 
-def parse_odds_from_tables(html):
+def parse_odds_explicit_combo(html):
+    rows = []
+    soup = BeautifulSoup(html, "html.parser")
+    text = clean_text(soup.get_text(" "))
+
+    patterns = [
+        r"([1-6])\s*[-–]\s*([1-6])\s*[-–]\s*([1-6])\s+(\d+\.\d+)",
+        r"\b([1-6]{3})\b\s+(\d+\.\d+)",
+    ]
+
+    for p in patterns:
+        for m in re.findall(p, text):
+            if len(m) == 4:
+                a, b, c, odd = m
+                if len({a, b, c}) == 3:
+                    rows.append({
+                        "買い目": f"{a}-{b}-{c}",
+                        "オッズ": to_float(odd),
+                        "取得方式": "explicit_text",
+                        "取得優先": 1,
+                    })
+            elif len(m) == 2:
+                combo, odd = m
+                if len(set(combo)) == 3:
+                    rows.append({
+                        "買い目": f"{combo[0]}-{combo[1]}-{combo[2]}",
+                        "オッズ": to_float(odd),
+                        "取得方式": "explicit_text_123",
+                        "取得優先": 2,
+                    })
+
+    return rows
+
+
+def parse_odds_table_restore(html):
     rows = []
 
     try:
@@ -480,42 +502,46 @@ def parse_odds_from_tables(html):
     except Exception:
         return rows
 
-    for t in tables:
-        raw_values = []
+    for table_index, t in enumerate(tables):
+        flat = []
 
         for v in t.values.flatten():
             s = clean_text(v)
-            if not s or s in ["nan", "None", "-"]:
+            if not s or s in ["nan", "None", "-", "—"]:
                 continue
-            raw_values.append(s)
+            flat.append(s)
 
-        raw = " ".join(raw_values)
+        text = " ".join(flat)
 
-        # 1-2-3 12.3 型
-        pattern_a = r"([1-6])\s*[-–]\s*([1-6])\s*[-–]\s*([1-6])\s+(\d+\.\d+)"
-        for a, b, c, odd in re.findall(pattern_a, raw):
-            if len({a, b, c}) == 3:
+        # まず明示的な 1-2-3 12.3 / 123 12.3
+        rows.extend(parse_odds_explicit_combo(text))
+
+        # 公式表はオッズだけが大量に並ぶケースがある
+        odds_values = []
+        for s in flat:
+            found = re.findall(r"\d+\.\d+", s)
+            for x in found:
+                v = to_float(x)
+                if 1.0 <= v <= 9999:
+                    odds_values.append(v)
+
+        # 120点分以上あれば、公式の標準順に割り当てる
+        if len(odds_values) >= 80:
+            combos = all_3t_combos()
+            limit = min(len(odds_values), len(combos))
+
+            for i in range(limit):
                 rows.append({
-                    "買い目": f"{a}-{b}-{c}",
-                    "オッズ": to_float(odd),
-                    "取得方式": "table_a"
+                    "買い目": combos[i],
+                    "オッズ": odds_values[i],
+                    "取得方式": f"table_restore_{table_index}",
+                    "取得優先": 3,
                 })
 
-        # 123 12.3 型
-        pattern_b = r"\b([1-6]{3})\b\s+(\d+\.\d+)"
-        for combo, odd in re.findall(pattern_b, raw):
-            if len(set(combo)) == 3:
-                rows.append({
-                    "買い目": f"{combo[0]}-{combo[1]}-{combo[2]}",
-                    "オッズ": to_float(odd),
-                    "取得方式": "table_b"
-                })
-
-        # BOATRACEのオッズ表は「1 2 3 12.3」みたいに分割されることもある
+        # 1 2 3 12.3 のトークン分割にも対応
         tokens = []
-        for s in raw_values:
-            parts = re.findall(r"[1-6]|\d+\.\d+", s)
-            tokens.extend(parts)
+        for s in flat:
+            tokens.extend(re.findall(r"[1-6]|\d+\.\d+", s))
 
         for i in range(len(tokens) - 3):
             a, b, c, odd = tokens[i], tokens[i + 1], tokens[i + 2], tokens[i + 3]
@@ -529,18 +555,38 @@ def parse_odds_from_tables(html):
                 rows.append({
                     "買い目": f"{a}-{b}-{c}",
                     "オッズ": to_float(odd),
-                    "取得方式": "table_tokens"
+                    "取得方式": "table_tokens",
+                    "取得優先": 2,
                 })
 
     return rows
 
 
-def parse_odds_from_raw_html(html):
+def parse_odds_raw_restore(html):
     rows = []
-
     raw = clean_text(html)
 
-    # 1-2-3:12.3 / 1_2_3 12.3 / 123 12.3 などを広めに拾う
+    # odds3tページ内にオッズの小数が大量にある場合、順番復元を試す
+    odds_values = []
+
+    for x in re.findall(r">\s*(\d+\.\d+)\s*<", raw):
+        v = to_float(x)
+        if 1.0 <= v <= 9999:
+            odds_values.append(v)
+
+    if len(odds_values) >= 80:
+        combos = all_3t_combos()
+        limit = min(len(odds_values), len(combos))
+
+        for i in range(limit):
+            rows.append({
+                "買い目": combos[i],
+                "オッズ": odds_values[i],
+                "取得方式": "raw_tag_restore",
+                "取得優先": 4,
+            })
+
+    # script内などの広め探索
     patterns = [
         r"([1-6])[-_–]([1-6])[-_–]([1-6])[^0-9]{0,10}(\d+\.\d+)",
         r"\b([1-6]{3})\b[^0-9]{0,10}(\d+\.\d+)",
@@ -554,7 +600,8 @@ def parse_odds_from_raw_html(html):
                     rows.append({
                         "買い目": f"{a}-{b}-{c}",
                         "オッズ": to_float(odd),
-                        "取得方式": "raw_a"
+                        "取得方式": "raw_combo",
+                        "取得優先": 2,
                     })
             elif len(m) == 2:
                 combo, odd = m
@@ -562,7 +609,8 @@ def parse_odds_from_raw_html(html):
                     rows.append({
                         "買い目": f"{combo[0]}-{combo[1]}-{combo[2]}",
                         "オッズ": to_float(odd),
-                        "取得方式": "raw_b"
+                        "取得方式": "raw_combo_123",
+                        "取得優先": 2,
                     })
 
     return rows
@@ -699,7 +747,6 @@ def build_tickets(power, odds):
 
         ev = ai * math.log(odd + 1)
 
-        # 人気過剰チェック
         if popularity and popularity <= 5 and odd < 8 and ai < 92:
             ev *= 0.88
 
@@ -780,8 +827,8 @@ def heavy_ai(df):
 # UI
 # =====================================================
 
-st.title("🚤 Boat Race AI v7")
-st.caption("実オッズ取得強化版 / 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI")
+st.title("🚤 Boat Race AI v7.1")
+st.caption("3連単オッズ復元強化版 / 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI")
 
 with st.sidebar:
     st.header("設定")
@@ -828,14 +875,16 @@ if run:
     power = calc_power(race, before)
 
     odds = parse_odds3t(htmls.get("3連単オッズ"))
-    odds_status = "実オッズ取得OK"
 
-    if odds.empty:
+    odds_count = len(odds)
+    odds_status = f"実オッズ取得OK：{odds_count}件"
+
+    if odds.empty or odds_count < 80:
         if allow_fallback_odds:
             odds = make_fallback_odds(power)
-            odds_status = "実オッズ取得失敗 → AI仮オッズで表示"
+            odds_status = f"実オッズ取得不足：{odds_count}件 → AI仮オッズで表示"
         else:
-            st.error("3連単オッズを取得できませんでした。AI仮オッズ表示をONにしてください。")
+            st.error(f"3連単オッズ取得不足です。取得件数：{odds_count}件")
             st.stop()
 
     tickets = build_tickets(power, odds)
@@ -846,9 +895,9 @@ if run:
 
     if show_debug:
         st.markdown("### オッズ取得デバッグ")
-        st.write(f"取得できたオッズ件数：{len(odds)}")
+        st.write(f"取得できたオッズ件数：{odds_count}")
         if not odds.empty:
-            st.dataframe(odds.head(30), width="stretch", hide_index=True)
+            st.dataframe(odds.head(40), width="stretch", hide_index=True)
 
     st.markdown("### 指数表")
 
