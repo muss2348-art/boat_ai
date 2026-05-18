@@ -1,6 +1,7 @@
 # boat_ai_app.py
-# Boat Race AI v5
-# 出走表取得強化版
+# Boat Race AI v6
+# 出走表取得さらに強化版
+# 2号艇/4号艇などの取りこぼし対策
 # 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI / 買い目点数 1〜20点
 
 import re
@@ -15,7 +16,7 @@ from bs4 import BeautifulSoup
 
 
 st.set_page_config(
-    page_title="Boat AI v5",
+    page_title="Boat AI v6",
     page_icon="🚤",
     layout="wide"
 )
@@ -31,6 +32,10 @@ JCD_MAP = {
     "芦屋": "21", "福岡": "22", "唐津": "23", "大村": "24",
 }
 
+
+# =====================================================
+# UTILS
+# =====================================================
 
 def clean_text(x):
     if x is None:
@@ -72,82 +77,15 @@ def fetch_pages(jcd, rno, hd):
         "直前情報": build_url("beforeinfo", rno, jcd, hd),
         "3連単オッズ": build_url("odds3t", rno, jcd, hd),
     }
-
-    htmls = {}
-    for name, url in urls.items():
-        htmls[name] = safe_get(url)
-
+    htmls = {name: safe_get(url) for name, url in urls.items()}
     return urls, htmls
 
 
 # =====================================================
-# 出走表取得 強化版
+# 出走表取得 v6
 # =====================================================
 
-def parse_racelist(html):
-    if not html:
-        return pd.DataFrame()
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    rows = []
-
-    # BOATRACE公式は艇ごとに table1_boatImage1〜6 が入りやすい
-    for waku in range(1, 7):
-        boat_img = soup.find(class_=re.compile(f"table1_boatImage{waku}"))
-        tr = None
-
-        if boat_img:
-            tr = boat_img.find_parent("tr")
-
-        if not tr:
-            # fallback：艇番テキストから近いtrを探す
-            for candidate in soup.find_all("tr"):
-                txt = clean_text(candidate.get_text(" "))
-                if txt.startswith(str(waku)) and re.search(r"A1|A2|B1|B2", txt):
-                    tr = candidate
-                    break
-
-        if not tr:
-            rows.append(default_boat_row(waku, "出走表取得弱い"))
-            continue
-
-        text = clean_text(tr.get_text(" "))
-
-        name = extract_name(text, waku)
-        grade = extract_grade(text)
-
-        nums = [to_float(x) for x in re.findall(r"\d+\.\d+", text)]
-
-        avg_st = extract_avg_st(nums)
-
-        national2, local2, motor2, boat2 = extract_rates(text, nums)
-
-        status = "OK"
-        if name == f"{waku}号艇" or grade == "":
-            status = "一部取得弱い"
-
-        rows.append({
-            "艇": waku,
-            "選手": name,
-            "級別": grade if grade else "B1",
-            "全国2連率": national2,
-            "当地2連率": local2,
-            "モーター": motor2,
-            "ボート": boat2,
-            "平均ST": avg_st,
-            "データ状態": status,
-        })
-
-    df = pd.DataFrame(rows)
-
-    # それでも弱い艇がある場合、ページ全体テキストから再補完
-    df = supplement_from_full_text(df, soup)
-
-    return df
-
-
-def default_boat_row(waku, status):
+def default_boat_row(waku, status="出走表取得弱い"):
     return {
         "艇": waku,
         "選手": f"{waku}号艇",
@@ -167,50 +105,52 @@ def extract_grade(text):
 
 
 def extract_name(text, waku):
-    # 級別の前後に選手名が出るケースを優先
-    patterns = [
-        r"\b(?:A1|A2|B1|B2)\b\s*([一-龥ぁ-んァ-ンー・\s]{2,12})",
-        r"\d{4}\s+\b(?:A1|A2|B1|B2)\b\s*([一-龥ぁ-んァ-ンー・\s]{2,12})",
-        r"([一-龥ぁ-んァ-ンー・]{2,}\s+[一-龥ぁ-んァ-ンー・]{1,})",
+    text = clean_text(text)
+
+    bad = [
+        "全国", "当地", "モーター", "ボート", "勝率", "展示",
+        "平均", "進入", "能力", "事故", "早見", "F", "L"
     ]
 
-    bad_words = [
-        "全国", "当地", "モーター", "ボート", "勝率",
-        "展示", "進入", "平均", "事故", "能力"
+    patterns = [
+        r"\b(A1|A2|B1|B2)\b\s*([一-龥ぁ-んァ-ンー・]{2,}\s*[一-龥ぁ-んァ-ンー・]{1,})",
+        r"\d{4}\s*\b(A1|A2|B1|B2)\b\s*([一-龥ぁ-んァ-ンー・]{2,}\s*[一-龥ぁ-んァ-ンー・]{1,})",
+        r"([一-龥]{1,4}\s+[一-龥ぁ-んァ-ンー・]{1,6})",
     ]
 
     for p in patterns:
         m = re.search(p, text)
-        if m:
-            name = clean_text(m.group(1))
-            name = re.sub(r"(全国|当地|モーター|ボート|勝率).*", "", name).strip()
-            if name and not any(b in name for b in bad_words):
-                if len(name) <= 12:
-                    return name
+        if not m:
+            continue
+
+        name = m.group(len(m.groups()))
+        name = clean_text(name)
+        name = re.sub(r"(全国|当地|モーター|ボート|勝率|平均).*", "", name).strip()
+
+        if name and len(name) <= 12 and not any(b in name for b in bad):
+            return name
 
     return f"{waku}号艇"
 
 
 def extract_avg_st(nums):
     st_like = [n for n in nums if 0.05 <= n <= 0.35]
-    if st_like:
-        return st_like[0]
-    return 0.18
+    return st_like[0] if st_like else 0.18
 
 
-def extract_rates(text, nums):
-    # 2連率は 0〜100 の小数。勝率やSTも混ざるので、ざっくり補正
-    vals = [n for n in nums if 0 <= n <= 100]
+def extract_rates_from_text(text):
+    nums = [to_float(x) for x in re.findall(r"\d+\.\d+", text)]
 
-    # STを除外
-    vals = [n for n in vals if not (0.05 <= n <= 0.35)]
+    avg_st = extract_avg_st(nums)
+
+    vals = [n for n in nums if 0 <= n <= 100 and not (0.05 <= n <= 0.35)]
 
     national2 = 0.0
     local2 = 0.0
     motor2 = 0.0
     boat2 = 0.0
 
-    # BOATRACE出走表は「勝率 / 2連率 / 3連率」が複数セットで出やすい
+    # 公式は「勝率/2連率/3連率」のセットが多い
     if len(vals) >= 3:
         national2 = vals[1]
     if len(vals) >= 6:
@@ -220,60 +160,222 @@ def extract_rates(text, nums):
     if len(vals) >= 12:
         boat2 = vals[10]
 
-    # 数値が変に小さすぎる場合の補正
-    if national2 > 0 and national2 < 10 and len(vals) >= 4:
+    # 2連率がなぜか小さい場合は隣の数値で補正
+    if 0 < national2 < 10 and len(vals) >= 4:
         national2 = vals[2]
-    if local2 > 0 and local2 < 10 and len(vals) >= 7:
+    if 0 < local2 < 10 and len(vals) >= 7:
         local2 = vals[5]
 
-    return round(national2, 2), round(local2, 2), round(motor2, 2), round(boat2, 2)
+    return round(national2, 2), round(local2, 2), round(motor2, 2), round(boat2, 2), avg_st
 
 
-def supplement_from_full_text(df, soup):
-    text = soup.get_text("\n")
-    blocks = re.split(r"\n\s*(?=[1-6]\s*\n)", text)
+def find_candidate_blocks(soup):
+    blocks = []
 
-    for idx, row in df.iterrows():
-        waku = int(row["艇"])
+    # 1. tr単位
+    for tr in soup.find_all("tr"):
+        txt = clean_text(tr.get_text(" "))
+        if re.search(r"\b(A1|A2|B1|B2)\b", txt):
+            blocks.append(txt)
 
-        if row["データ状態"] == "OK":
-            continue
+    # 2. div単位
+    for div in soup.find_all("div"):
+        txt = clean_text(div.get_text(" "))
+        if len(txt) > 30 and re.search(r"\b(A1|A2|B1|B2)\b", txt):
+            blocks.append(txt)
 
-        target = None
+    # 3. ページ全体を艇番で分割
+    full = soup.get_text("\n")
+    split_blocks = re.split(r"\n\s*(?=[1-6]\s*\n)", full)
+    for b in split_blocks:
+        txt = clean_text(b)
+        if re.search(r"\b(A1|A2|B1|B2)\b", txt):
+            blocks.append(txt)
+
+    # 重複削除
+    unique = []
+    seen = set()
+    for b in blocks:
+        if b not in seen:
+            seen.add(b)
+            unique.append(b)
+
+    return unique
+
+
+def block_score_for_waku(block, waku):
+    score = 0
+
+    if block.startswith(str(waku)):
+        score += 8
+
+    if re.search(rf"(^|\s){waku}(\s|号|$)", block):
+        score += 5
+
+    if f"table1_boatImage{waku}" in block:
+        score += 10
+
+    if re.search(r"\b(A1|A2|B1|B2)\b", block):
+        score += 3
+
+    nums = re.findall(r"\d+\.\d+", block)
+    score += min(len(nums), 12)
+
+    # 他艇番っぽい始まりなら少し減点
+    for other in range(1, 7):
+        if other != waku and block.startswith(str(other)):
+            score -= 5
+
+    return score
+
+
+def parse_racelist_by_tables(html):
+    try:
+        tables = pd.read_html(html)
+    except Exception:
+        return pd.DataFrame()
+
+    rows = []
+
+    for waku in range(1, 7):
+        best_text = ""
+
+        for t in tables:
+            raw = " ".join(map(str, t.values.flatten()))
+            raw = clean_text(raw)
+
+            pieces = re.split(rf"(?=(?:^|\s){waku}\s)", raw)
+
+            for p in pieces:
+                if not p:
+                    continue
+                if re.search(r"\b(A1|A2|B1|B2)\b", p):
+                    if block_score_for_waku(p, waku) > block_score_for_waku(best_text, waku):
+                        best_text = p
+
+        if best_text:
+            name = extract_name(best_text, waku)
+            grade = extract_grade(best_text)
+            national2, local2, motor2, boat2, avg_st = extract_rates_from_text(best_text)
+
+            rows.append({
+                "艇": waku,
+                "選手": name,
+                "級別": grade if grade else "B1",
+                "全国2連率": national2,
+                "当地2連率": local2,
+                "モーター": motor2,
+                "ボート": boat2,
+                "平均ST": avg_st,
+                "データ状態": "OKテーブル" if name != f"{waku}号艇" else "テーブル弱い",
+            })
+
+    return pd.DataFrame(rows)
+
+
+def parse_racelist(html):
+    if not html:
+        return pd.DataFrame()
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    table_df = parse_racelist_by_tables(html)
+
+    block_rows = []
+
+    blocks = find_candidate_blocks(soup)
+
+    for waku in range(1, 7):
+        best = ""
+        best_score = -999
+
+        # classから近い親要素も狙う
+        boat_img = soup.find(class_=re.compile(f"table1_boatImage{waku}"))
+        if boat_img:
+            parent = boat_img.find_parent(["tr", "div", "tbody"])
+            if parent:
+                txt = clean_text(parent.get_text(" "))
+                s = block_score_for_waku(txt, waku) + 10
+                if s > best_score:
+                    best = txt
+                    best_score = s
+
         for b in blocks:
-            b2 = clean_text(b)
-            if b2.startswith(str(waku)) and re.search(r"A1|A2|B1|B2", b2):
-                target = b2
-                break
+            s = block_score_for_waku(b, waku)
+            if s > best_score:
+                best = b
+                best_score = s
 
-        if not target:
+        if not best:
+            block_rows.append(default_boat_row(waku))
             continue
 
-        name = extract_name(target, waku)
-        grade = extract_grade(target)
-        nums = [to_float(x) for x in re.findall(r"\d+\.\d+", target)]
-        avg_st = extract_avg_st(nums)
-        national2, local2, motor2, boat2 = extract_rates(target, nums)
+        name = extract_name(best, waku)
+        grade = extract_grade(best)
+        national2, local2, motor2, boat2, avg_st = extract_rates_from_text(best)
 
-        if name != f"{waku}号艇":
-            df.loc[idx, "選手"] = name
-        if grade:
-            df.loc[idx, "級別"] = grade
-        if national2 > 0:
-            df.loc[idx, "全国2連率"] = national2
-        if local2 > 0:
-            df.loc[idx, "当地2連率"] = local2
-        if motor2 > 0:
-            df.loc[idx, "モーター"] = motor2
-        if boat2 > 0:
-            df.loc[idx, "ボート"] = boat2
-        if avg_st:
-            df.loc[idx, "平均ST"] = avg_st
+        status = "OK補完"
+        if name == f"{waku}号艇":
+            status = "出走表取得弱い"
 
-        if df.loc[idx, "選手"] != f"{waku}号艇":
-            df.loc[idx, "データ状態"] = "OK補完"
+        block_rows.append({
+            "艇": waku,
+            "選手": name,
+            "級別": grade if grade else "B1",
+            "全国2連率": national2,
+            "当地2連率": local2,
+            "モーター": motor2,
+            "ボート": boat2,
+            "平均ST": avg_st,
+            "データ状態": status,
+        })
 
-    return df
+    block_df = pd.DataFrame(block_rows)
+
+    # table_df と block_df を合成。名前が取れている方を優先。
+    final_rows = []
+
+    for waku in range(1, 7):
+        b = block_df[block_df["艇"] == waku]
+        t = table_df[table_df["艇"] == waku]
+
+        if b.empty and t.empty:
+            final_rows.append(default_boat_row(waku))
+            continue
+
+        row = b.iloc[0].to_dict() if not b.empty else default_boat_row(waku)
+
+        if not t.empty:
+            tr = t.iloc[0].to_dict()
+
+            # 選手名
+            if row["選手"] == f"{waku}号艇" and tr.get("選手") != f"{waku}号艇":
+                row["選手"] = tr.get("選手")
+
+            # 級別
+            if not row.get("級別") or row.get("級別") == "B1":
+                if tr.get("級別"):
+                    row["級別"] = tr.get("級別")
+
+            # 数値は大きい方ではなく、0なら補完
+            for col in ["全国2連率", "当地2連率", "モーター", "ボート"]:
+                if to_float(row.get(col)) <= 0 and to_float(tr.get(col)) > 0:
+                    row[col] = tr.get(col)
+
+            if to_float(row.get("平均ST"), 0.18) == 0.18 and to_float(tr.get("平均ST"), 0.18) != 0.18:
+                row["平均ST"] = tr.get("平均ST")
+
+        # 0データが多すぎる場合、完全減点しないため中立補正
+        zero_count = sum(1 for c in ["全国2連率", "当地2連率", "モーター", "ボート"] if to_float(row[c]) <= 0)
+
+        if row["選手"] != f"{waku}号艇" and zero_count >= 3:
+            row["データ状態"] = "名前OK/数値不足"
+        elif row["選手"] != f"{waku}号艇":
+            row["データ状態"] = "OK補完"
+
+        final_rows.append(row)
+
+    return pd.DataFrame(final_rows)
 
 
 # =====================================================
@@ -327,7 +429,6 @@ def parse_odds3t(html):
     text = clean_text(soup.get_text(" "))
 
     rows = []
-
     pattern = r"([1-6])\s*[-–]\s*([1-6])\s*[-–]\s*([1-6])\s+(\d+\.\d+)"
 
     for a, b, c, odd in re.findall(pattern, text):
@@ -381,6 +482,11 @@ def grade_score(g):
     return {"A1": 18, "A2": 12, "B1": 5, "B2": 1}.get(str(g), 5)
 
 
+def neutral_if_zero(value, neutral):
+    v = to_float(value)
+    return neutral if v <= 0 else v
+
+
 def calc_power(race, before):
     df = race.merge(before, on="艇", how="left")
 
@@ -393,10 +499,15 @@ def calc_power(race, before):
         score += {1: 30, 2: 18, 3: 12, 4: 11, 5: 5, 6: 2}.get(waku, 0)
         score += grade_score(r["級別"])
 
-        score += to_float(r["全国2連率"]) * 0.65
-        score += to_float(r["当地2連率"]) * 0.40
-        score += to_float(r["モーター"]) * 0.70
-        score += to_float(r["ボート"]) * 0.25
+        national = neutral_if_zero(r["全国2連率"], 25)
+        local = neutral_if_zero(r["当地2連率"], 25)
+        motor = neutral_if_zero(r["モーター"], 30)
+        boat = neutral_if_zero(r["ボート"], 30)
+
+        score += national * 0.65
+        score += local * 0.40
+        score += motor * 0.70
+        score += boat * 0.25
 
         avg_st = to_float(r["平均ST"], 0.18)
         score += max(0, (0.22 - avg_st) * 120)
@@ -411,7 +522,7 @@ def calc_power(race, before):
         if waku == 4 and tenji > 0 and tenji <= 6.78:
             score += 8
 
-        if waku == 5 and to_float(r["モーター"]) >= 40:
+        if waku == 5 and motor >= 40:
             score += 5
 
         scores.append(round(score, 1))
@@ -541,8 +652,8 @@ def heavy_ai(df):
 # UI
 # =====================================================
 
-st.title("🚤 Boat Race AI v5")
-st.caption("出走表取得強化版 / 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI")
+st.title("🚤 Boat Race AI v6")
+st.caption("出走表取得さらに強化版 / 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI")
 
 with st.sidebar:
     st.header("設定")
