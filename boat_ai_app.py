@@ -1,7 +1,7 @@
 # boat_ai_app.py
-# Boat Race AI v6
+# Boat Race AI v6.1
+# KeyError修正版
 # 出走表取得さらに強化版
-# 2号艇/4号艇などの取りこぼし対策
 # 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI / 買い目点数 1〜20点
 
 import re
@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 
 
 st.set_page_config(
-    page_title="Boat AI v6",
+    page_title="Boat AI v6.1",
     page_icon="🚤",
     layout="wide"
 )
@@ -32,10 +32,6 @@ JCD_MAP = {
     "芦屋": "21", "福岡": "22", "唐津": "23", "大村": "24",
 }
 
-
-# =====================================================
-# UTILS
-# =====================================================
 
 def clean_text(x):
     if x is None:
@@ -81,9 +77,12 @@ def fetch_pages(jcd, rno, hd):
     return urls, htmls
 
 
-# =====================================================
-# 出走表取得 v6
-# =====================================================
+def default_columns():
+    return [
+        "艇", "選手", "級別", "全国2連率", "当地2連率",
+        "モーター", "ボート", "平均ST", "データ状態"
+    ]
+
 
 def default_boat_row(waku, status="出走表取得弱い"):
     return {
@@ -142,7 +141,6 @@ def extract_rates_from_text(text):
     nums = [to_float(x) for x in re.findall(r"\d+\.\d+", text)]
 
     avg_st = extract_avg_st(nums)
-
     vals = [n for n in nums if 0 <= n <= 100 and not (0.05 <= n <= 0.35)]
 
     national2 = 0.0
@@ -150,7 +148,6 @@ def extract_rates_from_text(text):
     motor2 = 0.0
     boat2 = 0.0
 
-    # 公式は「勝率/2連率/3連率」のセットが多い
     if len(vals) >= 3:
         national2 = vals[1]
     if len(vals) >= 6:
@@ -160,7 +157,6 @@ def extract_rates_from_text(text):
     if len(vals) >= 12:
         boat2 = vals[10]
 
-    # 2連率がなぜか小さい場合は隣の数値で補正
     if 0 < national2 < 10 and len(vals) >= 4:
         national2 = vals[2]
     if 0 < local2 < 10 and len(vals) >= 7:
@@ -172,19 +168,16 @@ def extract_rates_from_text(text):
 def find_candidate_blocks(soup):
     blocks = []
 
-    # 1. tr単位
     for tr in soup.find_all("tr"):
         txt = clean_text(tr.get_text(" "))
         if re.search(r"\b(A1|A2|B1|B2)\b", txt):
             blocks.append(txt)
 
-    # 2. div単位
     for div in soup.find_all("div"):
         txt = clean_text(div.get_text(" "))
         if len(txt) > 30 and re.search(r"\b(A1|A2|B1|B2)\b", txt):
             blocks.append(txt)
 
-    # 3. ページ全体を艇番で分割
     full = soup.get_text("\n")
     split_blocks = re.split(r"\n\s*(?=[1-6]\s*\n)", full)
     for b in split_blocks:
@@ -192,7 +185,6 @@ def find_candidate_blocks(soup):
         if re.search(r"\b(A1|A2|B1|B2)\b", txt):
             blocks.append(txt)
 
-    # 重複削除
     unique = []
     seen = set()
     for b in blocks:
@@ -204,6 +196,9 @@ def find_candidate_blocks(soup):
 
 
 def block_score_for_waku(block, waku):
+    if not block:
+        return -999
+
     score = 0
 
     if block.startswith(str(waku)):
@@ -221,7 +216,6 @@ def block_score_for_waku(block, waku):
     nums = re.findall(r"\d+\.\d+", block)
     score += min(len(nums), 12)
 
-    # 他艇番っぽい始まりなら少し減点
     for other in range(1, 7):
         if other != waku and block.startswith(str(other)):
             score -= 5
@@ -233,7 +227,7 @@ def parse_racelist_by_tables(html):
     try:
         tables = pd.read_html(html)
     except Exception:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=default_columns())
 
     rows = []
 
@@ -270,26 +264,30 @@ def parse_racelist_by_tables(html):
                 "データ状態": "OKテーブル" if name != f"{waku}号艇" else "テーブル弱い",
             })
 
+    if not rows:
+        return pd.DataFrame(columns=default_columns())
+
     return pd.DataFrame(rows)
 
 
 def parse_racelist(html):
     if not html:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=default_columns())
 
     soup = BeautifulSoup(html, "html.parser")
 
     table_df = parse_racelist_by_tables(html)
 
-    block_rows = []
+    if table_df.empty or "艇" not in table_df.columns:
+        table_df = pd.DataFrame(columns=default_columns())
 
+    block_rows = []
     blocks = find_candidate_blocks(soup)
 
     for waku in range(1, 7):
         best = ""
         best_score = -999
 
-        # classから近い親要素も狙う
         boat_img = soup.find(class_=re.compile(f"table1_boatImage{waku}"))
         if boat_img:
             parent = boat_img.find_parent(["tr", "div", "tbody"])
@@ -332,12 +330,14 @@ def parse_racelist(html):
 
     block_df = pd.DataFrame(block_rows)
 
-    # table_df と block_df を合成。名前が取れている方を優先。
+    if block_df.empty or "艇" not in block_df.columns:
+        block_df = pd.DataFrame([default_boat_row(i) for i in range(1, 7)])
+
     final_rows = []
 
     for waku in range(1, 7):
         b = block_df[block_df["艇"] == waku]
-        t = table_df[table_df["艇"] == waku]
+        t = table_df[table_df["艇"] == waku] if "艇" in table_df.columns else pd.DataFrame()
 
         if b.empty and t.empty:
             final_rows.append(default_boat_row(waku))
@@ -348,16 +348,13 @@ def parse_racelist(html):
         if not t.empty:
             tr = t.iloc[0].to_dict()
 
-            # 選手名
             if row["選手"] == f"{waku}号艇" and tr.get("選手") != f"{waku}号艇":
                 row["選手"] = tr.get("選手")
 
-            # 級別
             if not row.get("級別") or row.get("級別") == "B1":
                 if tr.get("級別"):
                     row["級別"] = tr.get("級別")
 
-            # 数値は大きい方ではなく、0なら補完
             for col in ["全国2連率", "当地2連率", "モーター", "ボート"]:
                 if to_float(row.get(col)) <= 0 and to_float(tr.get(col)) > 0:
                     row[col] = tr.get(col)
@@ -365,8 +362,10 @@ def parse_racelist(html):
             if to_float(row.get("平均ST"), 0.18) == 0.18 and to_float(tr.get("平均ST"), 0.18) != 0.18:
                 row["平均ST"] = tr.get("平均ST")
 
-        # 0データが多すぎる場合、完全減点しないため中立補正
-        zero_count = sum(1 for c in ["全国2連率", "当地2連率", "モーター", "ボート"] if to_float(row[c]) <= 0)
+        zero_count = sum(
+            1 for c in ["全国2連率", "当地2連率", "モーター", "ボート"]
+            if to_float(row.get(c)) <= 0
+        )
 
         if row["選手"] != f"{waku}号艇" and zero_count >= 3:
             row["データ状態"] = "名前OK/数値不足"
@@ -377,10 +376,6 @@ def parse_racelist(html):
 
     return pd.DataFrame(final_rows)
 
-
-# =====================================================
-# 直前情報
-# =====================================================
 
 def parse_beforeinfo(html):
     base = pd.DataFrame([
@@ -416,10 +411,6 @@ def parse_beforeinfo(html):
 
     return base
 
-
-# =====================================================
-# オッズ
-# =====================================================
 
 def parse_odds3t(html):
     if not html:
@@ -473,10 +464,6 @@ def make_fallback_odds(power):
 
     return pd.DataFrame(rows)
 
-
-# =====================================================
-# AI LOGIC
-# =====================================================
 
 def grade_score(g):
     return {"A1": 18, "A2": 12, "B1": 5, "B2": 1}.get(str(g), 5)
@@ -648,12 +635,8 @@ def heavy_ai(df):
     return out.sort_values("厚張り指数", ascending=False).head(3).reset_index(drop=True)
 
 
-# =====================================================
-# UI
-# =====================================================
-
-st.title("🚤 Boat Race AI v6")
-st.caption("出走表取得さらに強化版 / 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI")
+st.title("🚤 Boat Race AI v6.1")
+st.caption("KeyError修正版 / 出走表取得強化 / 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI")
 
 with st.sidebar:
     st.header("設定")
