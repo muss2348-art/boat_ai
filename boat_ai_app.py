@@ -1,6 +1,6 @@
 # boat_ai_app.py
-# BOATRACE AI v7.8
-# 出走表数値ズレ修正・3連単オッズ直接解析強化版
+# BOATRACE AI v7.9
+# 3連単オッズ取得強化版
 # GitHub + Streamlit Cloud 用
 
 import re
@@ -15,7 +15,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-APP_VERSION = "v7.8 出走表数値ズレ修正・オッズ解析強化版"
+APP_VERSION = "v7.9 3連単オッズ取得強化版"
 
 JCD_MAP = {
     "01": "桐生", "02": "戸田", "03": "江戸川", "04": "平和島", "05": "多摩川", "06": "浜名湖",
@@ -77,7 +77,7 @@ def clean_text(s: str) -> str:
 def safe_float(x, default=0.0) -> float:
     try:
         x = clean_text(x).replace("%", "").replace("F", "").strip()
-        if x in ["", "-", "－", "None", "nan"]:
+        if x in ["", "-", "－", "None", "nan", "欠場"]:
             return default
         return float(x)
     except Exception:
@@ -126,8 +126,8 @@ def soup_lines(html: str) -> List[str]:
 
 def extract_event_name(html: str, place: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
-
     title = clean_text(soup.title.get_text(" ")) if soup.title else ""
+
     if title:
         title = re.sub(r"出走表.*", "", title)
         title = re.sub(r"【.*", "", title)
@@ -138,8 +138,8 @@ def extract_event_name(html: str, place: str) -> str:
         if 5 <= len(title) <= 80 and title not in ["G3", "ヴィーナスシリーズ", "ルーキーシリーズ"]:
             return title
 
-    ng = ["G1", "G2", "G3", "SG", "ヴィーナスシリーズ", "ルーキーシリーズ", "一般戦", "出走表"]
     candidates = []
+    ng = ["G1", "G2", "G3", "SG", "ヴィーナスシリーズ", "ルーキーシリーズ", "一般戦", "出走表"]
 
     for tag in soup.find_all(["h1", "h2", "h3", "div", "p", "span"]):
         txt = clean_text(tag.get_text(" "))
@@ -153,18 +153,13 @@ def extract_event_name(html: str, place: str) -> str:
 
 
 def cell_texts(row) -> List[str]:
-    vals = []
-    for td in row.find_all(["td", "th"]):
-        vals.append(clean_text(td.get_text("\n")))
-    return vals
+    return [clean_text(td.get_text("\n")) for td in row.find_all(["td", "th"])]
 
 
 def extract_lane_from_text(text: str) -> int:
     text = clean_text(text)
     m = re.match(r"^([1-6])(?:\s|$|Image)", text)
-    if m:
-        return int(m.group(1))
-    return 0
+    return int(m.group(1)) if m else 0
 
 
 def extract_name_from_text(text: str) -> str:
@@ -201,14 +196,6 @@ def extract_reg_class(text: str) -> Tuple[str, str]:
 
 
 def parse_stats_from_racer_text(text: str) -> Dict[str, float]:
-    """
-    v7.8で重要：
-    公式出走表のレーサーブロックは概ね以下の順で小数が出る。
-    平均ST, 全国勝率, 全国2連率, 全国3連率,
-    当地勝率, 当地2連率, 当地3連率,
-    モーター2連率, モーター3連率,
-    ボート2連率, ボート3連率
-    """
     nums = [safe_float(x) for x in re.findall(r"[-+]?\d+\.\d+", clean_text(text))]
 
     avg_st = 0.18
@@ -219,10 +206,7 @@ def parse_stats_from_racer_text(text: str) -> Dict[str, float]:
             start_idx = i
             break
 
-    if start_idx is None:
-        rate = nums
-    else:
-        rate = nums[start_idx + 1:]
+    rate = nums[start_idx + 1:] if start_idx is not None else nums
 
     def get(i, default=0.0):
         return rate[i] if len(rate) > i else default
@@ -243,10 +227,6 @@ def parse_stats_from_racer_text(text: str) -> Dict[str, float]:
 
 
 def extract_motor_boat_no(text: str) -> Tuple[int, int]:
-    """
-    モーター番号・ボート番号は公式HTMLの列構造でズレやすい。
-    まず「モーター」「ボート」の近辺を見て、無理なら最後寄りの番号を使う。
-    """
     text = clean_text(text)
     motor_no = 0
     boat_no = 0
@@ -275,18 +255,16 @@ def parse_racer_from_text(lane: int, text: str) -> Racer:
     text = clean_text(text)
 
     _, klass = extract_reg_class(text)
-    name = extract_name_from_text(text)
-    if not name:
-        name = f"{lane}号艇"
-
+    name = extract_name_from_text(text) or f"{lane}号艇"
     stats = parse_stats_from_racer_text(text)
     motor_no, boat_no = extract_motor_boat_no(text)
 
-    status = []
-    status.append("名前OK" if name != f"{lane}号艇" else "名前取得弱い")
-    status.append("全国OK" if stats["national_2"] > 0 else "全国2連弱い")
-    status.append("当地OK" if stats["local_2"] > 0 else "当地2連弱い")
-    status.append("機力OK" if stats["motor_2"] > 0 else "モーター弱い")
+    status = [
+        "名前OK" if name != f"{lane}号艇" else "名前取得弱い",
+        "全国OK" if stats["national_2"] > 0 else "全国2連弱い",
+        "当地OK" if stats["local_2"] > 0 else "当地2連弱い",
+        "機力OK" if stats["motor_2"] > 0 else "モーター弱い",
+    ]
 
     return Racer(
         lane=lane,
@@ -331,7 +309,7 @@ def parse_racelist_by_tables(html: str) -> List[Racer]:
         if not lane:
             lane = extract_lane_from_text(row_text)
 
-        if lane and 1 <= lane <= 6:
+        if lane:
             racers.append(parse_racer_from_text(lane, row_text))
 
     uniq = {}
@@ -350,7 +328,6 @@ def parse_racelist_by_lines(html: str) -> List[Racer]:
         lane = extract_lane_from_text(line)
         if not lane:
             continue
-
         look = "\n".join(lines[i:i + 30])
         if re.search(r"\d{4}\s*/\s*[AB][12]", look):
             starts.append((i, lane))
@@ -365,15 +342,13 @@ def parse_racelist_by_lines(html: str) -> List[Racer]:
     racers = []
     for idx, (start_i, lane) in enumerate(uniq_starts):
         end_i = uniq_starts[idx + 1][0] if idx + 1 < len(uniq_starts) else len(lines)
-        block_text = "\n".join(lines[start_i:end_i])
-        racers.append(parse_racer_from_text(lane, block_text))
+        racers.append(parse_racer_from_text(lane, "\n".join(lines[start_i:end_i])))
 
     return sorted(racers, key=lambda r: r.lane)
 
 
 def parse_racelist(html: str, place: str) -> Tuple[List[Racer], Dict]:
     event_name = extract_event_name(html, place)
-
     racers = parse_racelist_by_tables(html)
     method = "table"
 
@@ -384,31 +359,21 @@ def parse_racelist(html: str, place: str) -> Tuple[List[Racer], Dict]:
             method = "lines"
 
     uniq = {r.lane: r for r in racers}
-
     for lane in range(1, 7):
         if lane not in uniq:
-            uniq[lane] = Racer(
-                lane=lane,
-                name=f"{lane}号艇",
-                klass="B1",
-                data_status="出走表フォールバック"
-            )
+            uniq[lane] = Racer(lane=lane, name=f"{lane}号艇", data_status="出走表フォールバック")
 
-    racers = [uniq[k] for k in sorted(uniq)]
-
-    meta = {
+    return [uniq[k] for k in sorted(uniq)], {
         "event_name": event_name,
         "method": method,
         "raw_lines_sample": soup_lines(html)[:220],
     }
-    return racers, meta
 
 
 def parse_beforeinfo(html: str, racers: List[Racer]) -> Dict:
     soup = BeautifulSoup(html, "html.parser")
     by_lane = {r.lane: r for r in racers}
 
-    # 展示タイム・チルト
     for row in soup.find_all("tr"):
         vals = cell_texts(row)
         if not vals:
@@ -436,10 +401,7 @@ def parse_beforeinfo(html: str, racers: List[Racer]) -> Dict:
                 by_lane[lane].tilt = t
                 break
 
-    # 展示ST
-    lines = soup_lines(html)
-    joined = "\n".join(lines)
-
+    joined = "\n".join(soup_lines(html))
     for m in re.finditer(r"([1-6])\s+(F)?\.?(\d{2})", joined):
         lane = int(m.group(1))
         if lane in by_lane:
@@ -451,53 +413,195 @@ def parse_beforeinfo(html: str, racers: List[Racer]) -> Dict:
     return {"beforeinfo_ok": True}
 
 
-def parse_odds3t(html: str) -> Dict[str, float]:
-    """
-    3連単オッズ強化版。
-    公式の表は崩れることがあるため、
-    1. a-b-c オッズ型
-    2. pandas read_html
-    3. テキスト内の 123 45.6 型
-    の順で拾う。
-    """
-    odds: Dict[str, float] = {}
-    soup = BeautifulSoup(html, "html.parser")
-    text = clean_text(soup.get_text(" "))
+def normalize_combo_key(s: str) -> str:
+    s = clean_text(s)
+    s = s.replace("→", "-").replace("ー", "-").replace("－", "-")
+    s = re.sub(r"\s+", "", s)
 
-    # 1-2-3 形式
-    for m in re.finditer(r"([1-6])[-ー]([1-6])[-ー]([1-6])\s+(\d+\.\d+)", text):
+    m = re.search(r"([1-6])[-]?([1-6])[-]?([1-6])", s)
+    if not m:
+        return ""
+
+    a, b, c = m.groups()
+    if len({a, b, c}) != 3:
+        return ""
+
+    return f"{a}-{b}-{c}"
+
+
+def parse_odds_from_plain_text(text: str) -> Dict[str, float]:
+    odds: Dict[str, float] = {}
+    text = clean_text(text)
+
+    patterns = [
+        r"([1-6])[-ー－]([1-6])[-ー－]([1-6])\s+(\d+\.\d+)",
+        r"\b([1-6]{3})\s+(\d+\.\d+)\b",
+        r"([1-6])\s*→\s*([1-6])\s*→\s*([1-6])\s+(\d+\.\d+)",
+    ]
+
+    for m in re.finditer(patterns[0], text):
         a, b, c, v = m.groups()
         if len({a, b, c}) == 3:
             odds[f"{a}-{b}-{c}"] = safe_float(v)
 
-    # 123 45.6 形式
-    for m in re.finditer(r"\b([1-6]{3})\s+(\d+\.\d+)\b", text):
+    for m in re.finditer(patterns[1], text):
         nums, v = m.groups()
         a, b, c = nums[0], nums[1], nums[2]
         if len({a, b, c}) == 3:
             odds[f"{a}-{b}-{c}"] = safe_float(v)
 
-    # tableからも拾う
+    for m in re.finditer(patterns[2], text):
+        a, b, c, v = m.groups()
+        if len({a, b, c}) == 3:
+            odds[f"{a}-{b}-{c}"] = safe_float(v)
+
+    return odds
+
+
+def parse_odds_from_tables(html: str) -> Dict[str, float]:
+    odds: Dict[str, float] = {}
+    soup = BeautifulSoup(html, "html.parser")
+
+    # まず、HTMLテーブルのセルをそのまま見る
+    for table in soup.find_all("table"):
+        table_text = clean_text(table.get_text(" "))
+        odds.update(parse_odds_from_plain_text(table_text))
+
+        rows = table.find_all("tr")
+        for row in rows:
+            cells = cell_texts(row)
+            if not cells:
+                continue
+
+            row_text = " ".join(cells)
+            odds.update(parse_odds_from_plain_text(row_text))
+
+            # セルが「123」「45.6」のように分離されているケース
+            for i in range(len(cells) - 1):
+                key = normalize_combo_key(cells[i])
+                val = safe_float(cells[i + 1], 0.0)
+                if key and val > 0:
+                    odds[key] = val
+
+            # 1着・2着・3着・オッズが別セルのケース
+            for i in range(len(cells) - 3):
+                a, b, c = cells[i], cells[i + 1], cells[i + 2]
+                v = cells[i + 3]
+                if re.fullmatch(r"[1-6]", a) and re.fullmatch(r"[1-6]", b) and re.fullmatch(r"[1-6]", c):
+                    if len({a, b, c}) == 3:
+                        val = safe_float(v, 0.0)
+                        if val > 0:
+                            odds[f"{a}-{b}-{c}"] = val
+
+    # pandas側でも拾う
     try:
         tables = pd.read_html(html)
         for df in tables:
             flat = [clean_text(x) for x in map(str, df.values.flatten()) if clean_text(x)]
             joined = " ".join(flat)
+            odds.update(parse_odds_from_plain_text(joined))
 
-            for m in re.finditer(r"([1-6])[-ー]([1-6])[-ー]([1-6])\s+(\d+\.\d+)", joined):
-                a, b, c, v = m.groups()
-                if len({a, b, c}) == 3:
-                    odds[f"{a}-{b}-{c}"] = safe_float(v)
-
-            for m in re.finditer(r"\b([1-6]{3})\s+(\d+\.\d+)\b", joined):
-                nums, v = m.groups()
-                a, b, c = nums[0], nums[1], nums[2]
-                if len({a, b, c}) == 3:
-                    odds[f"{a}-{b}-{c}"] = safe_float(v)
+            for i in range(len(flat) - 1):
+                key = normalize_combo_key(flat[i])
+                val = safe_float(flat[i + 1], 0.0)
+                if key and val > 0:
+                    odds[key] = val
     except Exception:
         pass
 
     return odds
+
+
+def parse_boatrace_matrix_odds(html: str) -> Dict[str, float]:
+    """
+    BOATRACE公式の3連単表は、
+    1着ごとに「2着」「3着」「オッズ」がマトリクス状になることがある。
+    v7.9では完全復元ではなく、取れる構造だけ広めに拾う。
+    """
+    odds: Dict[str, float] = {}
+    soup = BeautifulSoup(html, "html.parser")
+
+    for table in soup.find_all("table"):
+        text = clean_text(table.get_text("\n"))
+        lines = [x for x in text.splitlines() if clean_text(x)]
+
+        # テーブル内に「1着」候補がある場合
+        first_candidates = []
+        for line in lines:
+            m = re.search(r"([1-6])\s*着", line)
+            if m:
+                first_candidates.append(int(m.group(1)))
+
+        # fallback：テーブル直前・captionなど
+        cap = table.find("caption")
+        if cap:
+            cap_txt = clean_text(cap.get_text(" "))
+            m = re.search(r"([1-6])", cap_txt)
+            if m:
+                first_candidates.append(int(m.group(1)))
+
+        first_candidates = list(dict.fromkeys(first_candidates))
+
+        # 完全に取れない場合は通常解析に任せる
+        if not first_candidates:
+            continue
+
+        first = first_candidates[0]
+
+        # 行内に「2着候補 3着候補 オッズ」が並ぶケース
+        for line in lines:
+            nums = re.findall(r"\b[1-6]\b|\d+\.\d+", line)
+            if len(nums) < 3:
+                continue
+
+            small = [x for x in nums if re.fullmatch(r"[1-6]", x)]
+            vals = [safe_float(x) for x in nums if re.fullmatch(r"\d+\.\d+", x)]
+
+            if len(small) >= 2 and vals:
+                second = int(small[0])
+                third = int(small[1])
+                val = vals[-1]
+                if len({first, second, third}) == 3 and val > 0:
+                    odds[f"{first}-{second}-{third}"] = val
+
+    return odds
+
+
+def fetch_and_parse_odds3t(rno: str, jcd: str, hd: str) -> Tuple[Dict[str, float], Dict]:
+    """
+    複数URLを試して3連単オッズを取得。
+    """
+    urls = [
+        make_url("odds3t", rno, jcd, hd),
+        f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd}&hd={hd}",
+        f"https://www.boatrace.jp/owpc/pc/race/odds3t?hd={hd}&jcd={jcd}&rno={rno}",
+    ]
+
+    best_odds: Dict[str, float] = {}
+    best_url = urls[0]
+    errors = []
+
+    for url in urls:
+        try:
+            html = fetch_html(url)
+            odds = {}
+            odds.update(parse_odds_from_plain_text(BeautifulSoup(html, "html.parser").get_text(" ")))
+            odds.update(parse_odds_from_tables(html))
+            odds.update(parse_boatrace_matrix_odds(html))
+
+            if len(odds) > len(best_odds):
+                best_odds = odds
+                best_url = url
+        except Exception as e:
+            errors.append(f"{url}: {e}")
+
+    meta = {
+        "odds_url": best_url,
+        "odds_count": len(best_odds),
+        "odds_errors": errors,
+        "odds_sample": dict(list(best_odds.items())[:30]),
+    }
+    return best_odds, meta
 
 
 def class_bonus(klass: str) -> float:
@@ -517,26 +621,14 @@ def calculate_scores(racers: List[Racer]) -> List[Racer]:
 
         if r.avg_st:
             score += max(0, (0.20 - r.avg_st) * 80)
-
         if r.display_time:
             score += max(0, (7.25 - r.display_time) * 20)
-
         if r.tenji_st:
             score += max(0, (0.15 - r.tenji_st) * 55)
-
         if r.tenji_f:
             score -= 7.0
 
-        lane_bonus = {
-            1: 9.5,
-            2: 4.5,
-            3: 2.5,
-            4: 1.0,
-            5: -2.0,
-            6: -4.0,
-        }
-        score += lane_bonus.get(r.lane, 0.0)
-
+        score += {1: 9.5, 2: 4.5, 3: 2.5, 4: 1.0, 5: -2.0, 6: -4.0}.get(r.lane, 0.0)
         r.score = round(score, 1)
 
     return sorted(racers, key=lambda x: x.score, reverse=True)
@@ -574,15 +666,12 @@ def make_ai_table(racers: List[Racer]) -> pd.DataFrame:
 
 def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer]) -> float:
     a, b, c = combo
-    r1 = racer_map[a]
-    r2 = racer_map[b]
-    r3 = racer_map[c]
+    r1, r2, r3 = racer_map[a], racer_map[b], racer_map[c]
 
     s = r1.score * 1.00 + r2.score * 0.68 + r3.score * 0.46
 
     if a == 1:
         s += 7.0
-
     if r1.klass == "A1":
         s += 5.0
     elif r1.klass == "A2":
@@ -631,7 +720,6 @@ def generate_predictions(racers: List[Racer], odds: Dict[str, float]) -> pd.Data
     labels = []
     for i, row in df.iterrows():
         odd = row["オッズ"]
-
         if i < 2:
             labels.append("熱🔥")
         elif i < 6:
@@ -652,7 +740,6 @@ def generate_predictions(racers: List[Racer], odds: Dict[str, float]) -> pd.Data
 
     if confidence >= 72:
         df.loc[df.index[:2], "厚張りAI"] = "候補"
-
     if confidence >= 82:
         df.loc[df.index[:1], "厚張りAI"] = "強"
 
@@ -661,7 +748,6 @@ def generate_predictions(racers: List[Racer], odds: Dict[str, float]) -> pd.Data
 
 def build_note_text(event_name: str, place: str, rno: str, ai_df: pd.DataFrame, pred_df: pd.DataFrame) -> str:
     lines = []
-
     title = f"{place}{rno}R"
     if event_name:
         title += f"｜{event_name}"
@@ -677,23 +763,17 @@ def build_note_text(event_name: str, place: str, rno: str, ai_df: pd.DataFrame, 
 
     lines.append("")
     lines.append("【買い目】")
-
     for _, row in pred_df.head(8).iterrows():
         odds_txt = f"（{row['オッズ']}倍）" if row["オッズ"] else ""
         lines.append(f"{row['区分']} {row['買い目']} {odds_txt}")
 
     lines.append("")
     lines.append("※指数表・印とは連動していない場合もございます。")
-
     return "\n".join(lines)
 
 
 def main():
-    st.set_page_config(
-        page_title="BOATRACE AI",
-        page_icon="🚤",
-        layout="wide",
-    )
+    st.set_page_config(page_title="BOATRACE AI", page_icon="🚤", layout="wide")
 
     st.title("🚤 BOATRACE AI")
     st.caption(APP_VERSION)
@@ -705,10 +785,8 @@ def main():
 
     with col1:
         use_before = st.checkbox("直前情報を取得", value=True)
-
     with col2:
         use_odds = st.checkbox("3連単オッズを取得", value=True)
-
     with col3:
         debug = st.checkbox("デバッグ表示", value=False)
 
@@ -719,7 +797,6 @@ def main():
 
             racelist_url = make_url("racelist", rno, jcd, hd)
             before_url = make_url("beforeinfo", rno, jcd, hd)
-            odds_url = make_url("odds3t", rno, jcd, hd)
 
             with st.spinner("出走表を取得中..."):
                 racelist_html = fetch_html(racelist_url)
@@ -734,11 +811,11 @@ def main():
                         st.warning(f"直前情報の取得に失敗しました: {e}")
 
             odds = {}
+            odds_meta = {}
             if use_odds:
                 with st.spinner("3連単オッズを取得中..."):
                     try:
-                        odds_html = fetch_html(odds_url)
-                        odds = parse_odds3t(odds_html)
+                        odds, odds_meta = fetch_and_parse_odds3t(rno, jcd, hd)
                     except Exception as e:
                         st.warning(f"オッズ取得に失敗しました: {e}")
 
@@ -751,14 +828,12 @@ def main():
                 st.write(meta["event_name"])
 
             name_ok = int((~ai_df["選手"].astype(str).str.contains("号艇")).sum())
-
             if name_ok == 6:
                 st.success("選手名取得：6/6艇 OK")
             else:
                 st.warning(f"選手名取得：{name_ok}/6艇。フォールバックが残っています。")
 
             before_ok = int((ai_df["展示"].astype(float) > 0).sum())
-
             if use_before:
                 if before_ok == 6:
                     st.success("直前情報：展示タイム 6/6艇 OK")
@@ -778,7 +853,6 @@ def main():
             st.dataframe(pred_df, width="stretch", hide_index=True)
 
             confidence = pred_df["勝負度"].iloc[0] if len(pred_df) else 0
-
             if confidence >= 82:
                 st.error(f"勝負度：{confidence}%　厚張り候補あり")
             elif confidence >= 72:
@@ -798,7 +872,7 @@ def main():
                 st.code(
                     f"出走表: {racelist_url}\n"
                     f"直前情報: {before_url}\n"
-                    f"3連単オッズ: {odds_url}"
+                    f"3連単オッズ: {odds_meta.get('odds_url', make_url('odds3t', rno, jcd, hd))}"
                 )
 
                 st.markdown("### 出走表抽出方式")
@@ -810,8 +884,12 @@ def main():
                 st.markdown("### オッズ取得件数")
                 st.write(len(odds))
 
-                if odds:
-                    st.write(dict(list(odds.items())[:30]))
+                st.markdown("### オッズサンプル")
+                st.write(odds_meta.get("odds_sample", dict(list(odds.items())[:30])))
+
+                if odds_meta.get("odds_errors"):
+                    st.markdown("### オッズ取得エラー")
+                    st.write(odds_meta.get("odds_errors"))
 
         except Exception as e:
             st.error("処理中にエラーが発生しました。")
