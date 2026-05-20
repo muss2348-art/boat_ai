@@ -1,6 +1,6 @@
 # boat_ai_app.py
-# BOATRACE AI v7.7
-# 出走表テーブル直接抽出版
+# BOATRACE AI v7.8
+# 出走表数値ズレ修正・3連単オッズ直接解析強化版
 # GitHub + Streamlit Cloud 用
 
 import re
@@ -15,7 +15,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-APP_VERSION = "v7.7 出走表テーブル直接抽出版"
+APP_VERSION = "v7.8 出走表数値ズレ修正・オッズ解析強化版"
 
 JCD_MAP = {
     "01": "桐生", "02": "戸田", "03": "江戸川", "04": "平和島", "05": "多摩川", "06": "浜名湖",
@@ -36,12 +36,18 @@ class Racer:
     name: str
     klass: str = "B1"
     avg_st: float = 0.18
+    national_win: float = 0.0
     national_2: float = 0.0
+    national_3: float = 0.0
+    local_win: float = 0.0
     local_2: float = 0.0
+    local_3: float = 0.0
     motor_no: int = 0
     motor_2: float = 0.0
+    motor_3: float = 0.0
     boat_no: int = 0
     boat_2: float = 0.0
+    boat_3: float = 0.0
     display_time: float = 0.0
     tilt: float = 0.0
     tenji_st: float = 0.0
@@ -137,9 +143,7 @@ def extract_event_name(html: str, place: str) -> str:
 
     for tag in soup.find_all(["h1", "h2", "h3", "div", "p", "span"]):
         txt = clean_text(tag.get_text(" "))
-        if not txt:
-            continue
-        if txt in ng:
+        if not txt or txt in ng:
             continue
         if any(k in txt for k in ["杯", "選手権", "グランプリ", "ダービー", "周年", "マンスリー"]):
             if 5 <= len(txt) <= 80:
@@ -151,12 +155,11 @@ def extract_event_name(html: str, place: str) -> str:
 def cell_texts(row) -> List[str]:
     vals = []
     for td in row.find_all(["td", "th"]):
-        txt = clean_text(td.get_text("\n"))
-        vals.append(txt)
+        vals.append(clean_text(td.get_text("\n")))
     return vals
 
 
-def extract_lane_from_row_text(text: str) -> int:
+def extract_lane_from_text(text: str) -> int:
     text = clean_text(text)
     m = re.match(r"^([1-6])(?:\s|$|Image)", text)
     if m:
@@ -169,7 +172,7 @@ def extract_name_from_text(text: str) -> str:
 
     for i, line in enumerate(lines):
         if re.search(r"\d{4}\s*/\s*[AB][12]", line):
-            for cand in lines[i + 1:i + 6]:
+            for cand in lines[i + 1:i + 8]:
                 if (
                     cand
                     and not re.search(r"\d|kg|F\d|L\d|/", cand)
@@ -178,71 +181,130 @@ def extract_name_from_text(text: str) -> str:
                     and "年齢" not in cand
                     and "全国" not in cand
                     and "当地" not in cand
+                    and "モーター" not in cand
+                    and "ボート" not in cand
                 ):
-                    return cand
+                    return cand.replace(" ", "")
 
     for line in lines:
-        if re.fullmatch(r"[一-龥ぁ-んァ-ヶー]+\s+[一-龥ぁ-んァ-ヶー]+", line):
-            return line
+        if re.fullmatch(r"[一-龥ぁ-んァ-ヶー]+\s*[一-龥ぁ-んァ-ヶー]+", line):
+            return line.replace(" ", "")
 
     return ""
+
+
+def extract_reg_class(text: str) -> Tuple[str, str]:
+    m = re.search(r"(\d{4})\s*/\s*([AB][12])", text)
+    if m:
+        return m.group(1), m.group(2)
+    return "", "B1"
+
+
+def parse_stats_from_racer_text(text: str) -> Dict[str, float]:
+    """
+    v7.8で重要：
+    公式出走表のレーサーブロックは概ね以下の順で小数が出る。
+    平均ST, 全国勝率, 全国2連率, 全国3連率,
+    当地勝率, 当地2連率, 当地3連率,
+    モーター2連率, モーター3連率,
+    ボート2連率, ボート3連率
+    """
+    nums = [safe_float(x) for x in re.findall(r"[-+]?\d+\.\d+", clean_text(text))]
+
+    avg_st = 0.18
+    start_idx = None
+    for i, n in enumerate(nums):
+        if 0.08 <= n <= 0.35:
+            avg_st = n
+            start_idx = i
+            break
+
+    if start_idx is None:
+        rate = nums
+    else:
+        rate = nums[start_idx + 1:]
+
+    def get(i, default=0.0):
+        return rate[i] if len(rate) > i else default
+
+    return {
+        "avg_st": avg_st,
+        "national_win": get(0),
+        "national_2": get(1),
+        "national_3": get(2),
+        "local_win": get(3),
+        "local_2": get(4),
+        "local_3": get(5),
+        "motor_2": get(6),
+        "motor_3": get(7),
+        "boat_2": get(8),
+        "boat_3": get(9),
+    }
+
+
+def extract_motor_boat_no(text: str) -> Tuple[int, int]:
+    """
+    モーター番号・ボート番号は公式HTMLの列構造でズレやすい。
+    まず「モーター」「ボート」の近辺を見て、無理なら最後寄りの番号を使う。
+    """
+    text = clean_text(text)
+    motor_no = 0
+    boat_no = 0
+
+    m_motor = re.search(r"モーター\s*([0-9]{1,3})", text)
+    if m_motor:
+        motor_no = safe_int(m_motor.group(1))
+
+    m_boat = re.search(r"ボート\s*([0-9]{1,3})", text)
+    if m_boat:
+        boat_no = safe_int(m_boat.group(1))
+
+    if not motor_no or not boat_no:
+        int_nums = [safe_int(x) for x in re.findall(r"\b\d{1,3}\b", text)]
+        cands = [x for x in int_nums if 1 <= x <= 99]
+        if len(cands) >= 2:
+            motor_no = motor_no or cands[-2]
+            boat_no = boat_no or cands[-1]
+        elif len(cands) == 1:
+            boat_no = boat_no or cands[-1]
+
+    return motor_no, boat_no
 
 
 def parse_racer_from_text(lane: int, text: str) -> Racer:
     text = clean_text(text)
 
-    m_class = re.search(r"\d{4}\s*/\s*([AB][12])", text)
-    klass = m_class.group(1) if m_class else "B1"
-
+    _, klass = extract_reg_class(text)
     name = extract_name_from_text(text)
     if not name:
         name = f"{lane}号艇"
 
-    nums = [safe_float(x) for x in re.findall(r"[-+]?\d+\.\d+", text)]
-
-    avg_st = 0.18
-    for n in nums:
-        if 0.08 <= n <= 0.35:
-            avg_st = n
-            break
-
-    rate_nums = [n for n in nums if n > 0.35]
-
-    national_2 = 0.0
-    local_2 = 0.0
-    motor_2 = 0.0
-    boat_2 = 0.0
-
-    if len(rate_nums) >= 2:
-        national_2 = rate_nums[1]
-    if len(rate_nums) >= 5:
-        local_2 = rate_nums[4]
-    if len(rate_nums) >= 7:
-        motor_2 = rate_nums[6]
-    if len(rate_nums) >= 9:
-        boat_2 = rate_nums[8]
-
-    int_nums = [safe_int(x) for x in re.findall(r"\b\d{1,3}\b", text)]
-    no_candidates = [x for x in int_nums if 1 <= x <= 99]
-    motor_no = no_candidates[-2] if len(no_candidates) >= 2 else 0
-    boat_no = no_candidates[-1] if len(no_candidates) >= 1 else 0
+    stats = parse_stats_from_racer_text(text)
+    motor_no, boat_no = extract_motor_boat_no(text)
 
     status = []
     status.append("名前OK" if name != f"{lane}号艇" else "名前取得弱い")
-    status.append("全国OK" if national_2 > 0 else "全国2連弱い")
-    status.append("機力OK" if motor_2 > 0 else "モーター弱い")
+    status.append("全国OK" if stats["national_2"] > 0 else "全国2連弱い")
+    status.append("当地OK" if stats["local_2"] > 0 else "当地2連弱い")
+    status.append("機力OK" if stats["motor_2"] > 0 else "モーター弱い")
 
     return Racer(
         lane=lane,
         name=name,
         klass=klass,
-        avg_st=avg_st,
-        national_2=national_2,
-        local_2=local_2,
+        avg_st=stats["avg_st"],
+        national_win=stats["national_win"],
+        national_2=stats["national_2"],
+        national_3=stats["national_3"],
+        local_win=stats["local_win"],
+        local_2=stats["local_2"],
+        local_3=stats["local_3"],
         motor_no=motor_no,
-        motor_2=motor_2,
+        motor_2=stats["motor_2"],
+        motor_3=stats["motor_3"],
         boat_no=boat_no,
-        boat_2=boat_2,
+        boat_2=stats["boat_2"],
+        boat_3=stats["boat_3"],
         data_status=" / ".join(status),
     )
 
@@ -251,8 +313,7 @@ def parse_racelist_by_tables(html: str) -> List[Racer]:
     soup = BeautifulSoup(html, "html.parser")
     racers = []
 
-    rows = soup.find_all("tr")
-    for row in rows:
+    for row in soup.find_all("tr"):
         vals = cell_texts(row)
         if not vals:
             continue
@@ -262,14 +323,13 @@ def parse_racelist_by_tables(html: str) -> List[Racer]:
             continue
 
         lane = 0
-
-        for v in vals[:3]:
-            lane = extract_lane_from_row_text(v)
+        for v in vals[:4]:
+            lane = extract_lane_from_text(v)
             if lane:
                 break
 
         if not lane:
-            lane = extract_lane_from_row_text(row_text)
+            lane = extract_lane_from_text(row_text)
 
         if lane and 1 <= lane <= 6:
             racers.append(parse_racer_from_text(lane, row_text))
@@ -287,12 +347,11 @@ def parse_racelist_by_lines(html: str) -> List[Racer]:
     starts = []
 
     for i, line in enumerate(lines):
-        m = re.match(r"^([1-6])(?:\s+Image)?$", line)
-        if not m:
+        lane = extract_lane_from_text(line)
+        if not lane:
             continue
 
-        lane = int(m.group(1))
-        look = "\n".join(lines[i:i + 20])
+        look = "\n".join(lines[i:i + 30])
         if re.search(r"\d{4}\s*/\s*[AB][12]", look):
             starts.append((i, lane))
 
@@ -316,8 +375,8 @@ def parse_racelist(html: str, place: str) -> Tuple[List[Racer], Dict]:
     event_name = extract_event_name(html, place)
 
     racers = parse_racelist_by_tables(html)
-
     method = "table"
+
     if len(racers) < 6:
         line_racers = parse_racelist_by_lines(html)
         if len(line_racers) > len(racers):
@@ -340,9 +399,8 @@ def parse_racelist(html: str, place: str) -> Tuple[List[Racer], Dict]:
     meta = {
         "event_name": event_name,
         "method": method,
-        "raw_lines_sample": soup_lines(html)[:180],
+        "raw_lines_sample": soup_lines(html)[:220],
     }
-
     return racers, meta
 
 
@@ -350,17 +408,16 @@ def parse_beforeinfo(html: str, racers: List[Racer]) -> Dict:
     soup = BeautifulSoup(html, "html.parser")
     by_lane = {r.lane: r for r in racers}
 
-    rows = soup.find_all("tr")
-
-    for row in rows:
+    # 展示タイム・チルト
+    for row in soup.find_all("tr"):
         vals = cell_texts(row)
         if not vals:
             continue
 
         row_text = "\n".join(vals)
         lane = 0
-        for v in vals[:3]:
-            lane = extract_lane_from_row_text(v)
+        for v in vals[:4]:
+            lane = extract_lane_from_text(v)
             if lane:
                 break
 
@@ -379,6 +436,7 @@ def parse_beforeinfo(html: str, racers: List[Racer]) -> Dict:
                 by_lane[lane].tilt = t
                 break
 
+    # 展示ST
     lines = soup_lines(html)
     joined = "\n".join(lines)
 
@@ -393,31 +451,51 @@ def parse_beforeinfo(html: str, racers: List[Racer]) -> Dict:
     return {"beforeinfo_ok": True}
 
 
-def parse_odds_text(text: str) -> Dict[str, float]:
-    text = clean_text(text)
-    odds = {}
+def parse_odds3t(html: str) -> Dict[str, float]:
+    """
+    3連単オッズ強化版。
+    公式の表は崩れることがあるため、
+    1. a-b-c オッズ型
+    2. pandas read_html
+    3. テキスト内の 123 45.6 型
+    の順で拾う。
+    """
+    odds: Dict[str, float] = {}
+    soup = BeautifulSoup(html, "html.parser")
+    text = clean_text(soup.get_text(" "))
 
+    # 1-2-3 形式
     for m in re.finditer(r"([1-6])[-ー]([1-6])[-ー]([1-6])\s+(\d+\.\d+)", text):
         a, b, c, v = m.groups()
         if len({a, b, c}) == 3:
             odds[f"{a}-{b}-{c}"] = safe_float(v)
 
-    return odds
+    # 123 45.6 形式
+    for m in re.finditer(r"\b([1-6]{3})\s+(\d+\.\d+)\b", text):
+        nums, v = m.groups()
+        a, b, c = nums[0], nums[1], nums[2]
+        if len({a, b, c}) == 3:
+            odds[f"{a}-{b}-{c}"] = safe_float(v)
 
-
-def parse_odds3t(html: str) -> Dict[str, float]:
-    odds = {}
-
+    # tableからも拾う
     try:
         tables = pd.read_html(html)
         for df in tables:
-            text = " ".join(map(str, df.values.flatten()))
-            odds.update(parse_odds_text(text))
+            flat = [clean_text(x) for x in map(str, df.values.flatten()) if clean_text(x)]
+            joined = " ".join(flat)
+
+            for m in re.finditer(r"([1-6])[-ー]([1-6])[-ー]([1-6])\s+(\d+\.\d+)", joined):
+                a, b, c, v = m.groups()
+                if len({a, b, c}) == 3:
+                    odds[f"{a}-{b}-{c}"] = safe_float(v)
+
+            for m in re.finditer(r"\b([1-6]{3})\s+(\d+\.\d+)\b", joined):
+                nums, v = m.groups()
+                a, b, c = nums[0], nums[1], nums[2]
+                if len({a, b, c}) == 3:
+                    odds[f"{a}-{b}-{c}"] = safe_float(v)
     except Exception:
         pass
-
-    if len(odds) < 10:
-        odds.update(parse_odds_text(" ".join(soup_lines(html))))
 
     return odds
 
@@ -431,10 +509,11 @@ def calculate_scores(racers: List[Racer]) -> List[Racer]:
         score = 50.0
 
         score += class_bonus(r.klass)
-        score += r.national_2 * 0.42
-        score += r.local_2 * 0.20
+        score += r.national_2 * 0.34
+        score += r.national_3 * 0.10
+        score += r.local_2 * 0.16
         score += r.motor_2 * 0.22
-        score += r.boat_2 * 0.10
+        score += r.boat_2 * 0.08
 
         if r.avg_st:
             score += max(0, (0.20 - r.avg_st) * 80)
@@ -477,10 +556,16 @@ def make_ai_table(racers: List[Racer]) -> pd.DataFrame:
             "展示": r.display_time,
             "展示ST": f"{'F' if r.tenji_f else ''}{r.tenji_st:.2f}" if r.tenji_st else 0,
             "平均ST": r.avg_st,
+            "全国勝率": r.national_win,
             "全国2連率": r.national_2,
+            "全国3連率": r.national_3,
+            "当地勝率": r.local_win,
             "当地2連率": r.local_2,
-            "モーター": r.motor_2,
-            "ボート": r.boat_2,
+            "当地3連率": r.local_3,
+            "モーター2連率": r.motor_2,
+            "モーター3連率": r.motor_3,
+            "ボート2連率": r.boat_2,
+            "ボート3連率": r.boat_3,
             "データ状態": r.data_status,
         })
 
@@ -726,7 +811,7 @@ def main():
                 st.write(len(odds))
 
                 if odds:
-                    st.write(dict(list(odds.items())[:20]))
+                    st.write(dict(list(odds.items())[:30]))
 
         except Exception as e:
             st.error("処理中にエラーが発生しました。")
