@@ -1,6 +1,6 @@
 # boat_ai_app.py
-# BOATRACE AI v10.0
-# 的中率アップAI・イン逃げ判定・1飛び警戒・買い目精度改善・UI整理版
+# BOATRACE AI v10.1
+# 軽量化・履歴保持・厳選AI/予想ボタン整理版
 # GitHub + Streamlit Cloud 用
 
 import re
@@ -16,7 +16,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-APP_VERSION = "v10.0 的中率アップAI・展開判定強化版"
+APP_VERSION = "v10.1 軽量化・履歴保持版"
 
 JST = timezone(timedelta(hours=9))
 
@@ -26,8 +26,6 @@ JCD_MAP = {
     "13": "尼崎", "14": "鳴門", "15": "丸亀", "16": "児島", "17": "宮島", "18": "徳山",
     "19": "下関", "20": "若松", "21": "芦屋", "22": "福岡", "23": "唐津", "24": "大村",
 }
-
-PLACE_TO_JCD = {v: k for k, v in JCD_MAP.items()}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -62,16 +60,12 @@ class Racer:
 def zen_to_han(s: str) -> str:
     if s is None:
         return ""
-    return str(s).translate(str.maketrans(
-        "０１２３４５６７８９．－＋　",
-        "0123456789.-+ "
-    ))
+    return str(s).translate(str.maketrans("０１２３４５６７８９．－＋　", "0123456789.-+ "))
 
 
 def clean_text(s: str) -> str:
     s = zen_to_han(str(s))
-    s = s.replace("\xa0", " ")
-    s = s.replace("\r", "\n")
+    s = s.replace("\xa0", " ").replace("\r", "\n")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n+", "\n", s)
     return s.strip()
@@ -87,9 +81,9 @@ def safe_float(x, default=0.0) -> float:
         return default
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_html(url: str) -> str:
-    r = requests.get(url, headers=HEADERS, timeout=20)
+    r = requests.get(url, headers=HEADERS, timeout=15)
     r.raise_for_status()
     r.encoding = r.apparent_encoding or "utf-8"
     return r.text
@@ -113,8 +107,7 @@ def soup_lines(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
-    text = soup.get_text("\n")
-    return [clean_text(x) for x in text.splitlines() if clean_text(x)]
+    return [clean_text(x) for x in soup.get_text("\n").splitlines() if clean_text(x)]
 
 
 def cell_texts(row) -> List[str]:
@@ -129,15 +122,9 @@ def extract_lane_from_text(text: str) -> int:
 def extract_event_name(html: str, place: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     title = clean_text(soup.title.get_text(" ")) if soup.title else ""
-
     if title:
-        title = re.sub(r"出走表.*", "", title)
-        title = re.sub(r"オッズ.*", "", title)
-        title = re.sub(r"直前情報.*", "", title)
-        title = re.sub(r"【.*", "", title)
-        title = title.replace("BOAT RACE", "")
-        title = title.replace("ボートレース", "")
-        title = title.replace(place, "")
+        title = re.sub(r"出走表.*|オッズ.*|直前情報.*|【.*", "", title)
+        title = title.replace("BOAT RACE", "").replace("ボートレース", "").replace(place, "")
         title = title.strip(" -｜|")
         if 5 <= len(title) <= 80 and title not in ["G3", "ヴィーナスシリーズ", "ルーキーシリーズ"]:
             return title
@@ -146,27 +133,18 @@ def extract_event_name(html: str, place: str) -> str:
 
 def extract_name_from_text(text: str) -> str:
     lines = [clean_text(x) for x in text.splitlines() if clean_text(x)]
-
     for i, line in enumerate(lines):
         if re.search(r"\d{4}\s*/\s*[AB][12]", line):
             for cand in lines[i + 1:i + 8]:
                 if (
                     cand
                     and not re.search(r"\d|kg|F\d|L\d|/", cand)
-                    and "支部" not in cand
-                    and "出身" not in cand
-                    and "年齢" not in cand
-                    and "全国" not in cand
-                    and "当地" not in cand
-                    and "モーター" not in cand
-                    and "ボート" not in cand
+                    and all(x not in cand for x in ["支部", "出身", "年齢", "全国", "当地", "モーター", "ボート"])
                 ):
                     return cand.replace(" ", "")
-
     for line in lines:
         if re.fullmatch(r"[一-龥ぁ-んァ-ヶー]+\s*[一-龥ぁ-んァ-ヶー]+", line):
             return line.replace(" ", "")
-
     return ""
 
 
@@ -177,7 +155,6 @@ def extract_reg_class(text: str) -> str:
 
 def parse_stats_from_racer_text(text: str) -> Dict[str, float]:
     nums = [safe_float(x) for x in re.findall(r"[-+]?\d+\.\d+", clean_text(text))]
-
     avg_st = 0.18
     start_idx = None
     for i, n in enumerate(nums):
@@ -185,7 +162,6 @@ def parse_stats_from_racer_text(text: str) -> Dict[str, float]:
             avg_st = n
             start_idx = i
             break
-
     rate = nums[start_idx + 1:] if start_idx is not None else nums
 
     def get(i, default=0.0):
@@ -193,16 +169,10 @@ def parse_stats_from_racer_text(text: str) -> Dict[str, float]:
 
     return {
         "avg_st": avg_st,
-        "national_win": get(0),
-        "national_2": get(1),
-        "national_3": get(2),
-        "local_win": get(3),
-        "local_2": get(4),
-        "local_3": get(5),
-        "motor_2": get(6),
-        "motor_3": get(7),
-        "boat_2": get(8),
-        "boat_3": get(9),
+        "national_win": get(0), "national_2": get(1), "national_3": get(2),
+        "local_win": get(3), "local_2": get(4), "local_3": get(5),
+        "motor_2": get(6), "motor_3": get(7),
+        "boat_2": get(8), "boat_3": get(9),
     }
 
 
@@ -240,25 +210,20 @@ def parse_racer_from_text(lane: int, text: str) -> Racer:
 def parse_racelist_by_tables(html: str) -> List[Racer]:
     soup = BeautifulSoup(html, "html.parser")
     racers = []
-
     for row in soup.find_all("tr"):
         vals = cell_texts(row)
         if not vals:
             continue
-
         row_text = "\n".join(vals)
         if not re.search(r"\d{4}\s*/\s*[AB][12]", row_text):
             continue
-
         lane = 0
         for v in vals[:4]:
             lane = extract_lane_from_text(v)
             if lane:
                 break
-
         if not lane:
             lane = extract_lane_from_text(row_text)
-
         if lane:
             racers.append(parse_racer_from_text(lane, row_text))
 
@@ -266,19 +231,16 @@ def parse_racelist_by_tables(html: str) -> List[Racer]:
     for r in racers:
         if r.lane not in uniq:
             uniq[r.lane] = r
-
     return [uniq[k] for k in sorted(uniq)]
 
 
 def parse_racelist_by_lines(html: str) -> List[Racer]:
     lines = soup_lines(html)
     starts = []
-
     for i, line in enumerate(lines):
         lane = extract_lane_from_text(line)
         if not lane:
             continue
-
         look = "\n".join(lines[i:i + 30])
         if re.search(r"\d{4}\s*/\s*[AB][12]", look):
             starts.append((i, lane))
@@ -294,7 +256,6 @@ def parse_racelist_by_lines(html: str) -> List[Racer]:
     for idx, (start_i, lane) in enumerate(uniq_starts):
         end_i = uniq_starts[idx + 1][0] if idx + 1 < len(uniq_starts) else len(lines)
         racers.append(parse_racer_from_text(lane, "\n".join(lines[start_i:end_i])))
-
     return sorted(racers, key=lambda r: r.lane)
 
 
@@ -314,10 +275,7 @@ def parse_racelist(html: str, place: str) -> Tuple[List[Racer], Dict]:
         if lane not in uniq:
             uniq[lane] = Racer(lane=lane, name=f"{lane}号艇", data_status="出走表フォールバック")
 
-    return [uniq[k] for k in sorted(uniq)], {
-        "event_name": event_name,
-        "method": method,
-    }
+    return [uniq[k] for k in sorted(uniq)], {"event_name": event_name, "method": method}
 
 
 def parse_beforeinfo(html: str, racers: List[Racer]) -> None:
@@ -328,19 +286,16 @@ def parse_beforeinfo(html: str, racers: List[Racer]) -> None:
         vals = cell_texts(row)
         if not vals:
             continue
-
         row_text = "\n".join(vals)
         lane = 0
         for v in vals[:4]:
             lane = extract_lane_from_text(v)
             if lane:
                 break
-
         if not lane or lane not in by_lane:
             continue
 
         floats = [safe_float(x) for x in re.findall(r"[-+]?\d+\.\d+", row_text)]
-
         display_candidates = [x for x in floats if 6.20 <= x <= 7.80]
         if display_candidates:
             by_lane[lane].display_time = display_candidates[0]
@@ -362,42 +317,28 @@ def parse_beforeinfo(html: str, racers: List[Racer]) -> None:
 
 
 def parse_decimal_odds_only(html: str) -> Dict[str, float]:
-    odds: Dict[str, float] = {}
+    odds = {}
     text = clean_text(BeautifulSoup(html, "html.parser").get_text(" "))
-
     for m in re.finditer(r"([1-6])[-ー－]([1-6])[-ー－]([1-6])\s+(\d+\.\d+)", text):
         a, b, c, v = m.groups()
         if len({a, b, c}) == 3:
             odds[f"{a}-{b}-{c}"] = safe_float(v)
-
     for m in re.finditer(r"\b([1-6]{3})\s+(\d+\.\d+)\b", text):
         nums, v = m.groups()
         a, b, c = nums[0], nums[1], nums[2]
         if len({a, b, c}) == 3:
             odds[f"{a}-{b}-{c}"] = safe_float(v)
-
     return odds
 
 
 def fetch_and_parse_odds3t(rno: str, jcd: str, hd: str) -> Tuple[Dict[str, float], Dict]:
     url = make_url("odds3t", rno, jcd, hd)
-
     try:
         html = fetch_html(url)
         odds = parse_decimal_odds_only(html)
-        return odds, {
-            "odds_url": url,
-            "odds_count": len(odds),
-            "odds_sample": dict(list(odds.items())[:50]),
-            "odds_warning": "人気順位の誤取得防止のため、小数オッズと判定できるものだけ使用しています。",
-        }
+        return odds, {"odds_url": url, "odds_count": len(odds), "odds_sample": dict(list(odds.items())[:50])}
     except Exception as e:
-        return {}, {
-            "odds_url": url,
-            "odds_count": 0,
-            "odds_sample": {},
-            "odds_warning": str(e),
-        }
+        return {}, {"odds_url": url, "odds_count": 0, "odds_sample": {}, "odds_warning": str(e)}
 
 
 def class_bonus(klass: str) -> float:
@@ -432,7 +373,6 @@ def calculate_scores(racers: List[Racer]) -> List[Racer]:
 def tactic_analysis(racers: List[Racer]) -> Dict:
     ranked = calculate_scores(racers)
     by_lane = {r.lane: r for r in racers}
-
     one = by_lane.get(1)
     two = by_lane.get(2)
     three = by_lane.get(3)
@@ -491,7 +431,6 @@ def tactic_analysis(racers: List[Racer]) -> Dict:
     if two and two.score >= ranked[0].score - 6:
         in_score += 3
         comments.append("2号艇相手有力")
-
     if three and three.score >= ranked[0].score - 6:
         hole_score += 4
         comments.append("3号艇連絡み注意")
@@ -526,13 +465,10 @@ def tactic_analysis(racers: List[Racer]) -> Dict:
 def race_confidence(racers: List[Racer]) -> Dict:
     ranked = calculate_scores(racers)
     tactic = tactic_analysis(racers)
-
     top = ranked[0]
     second = ranked[1]
-
     top_gap = top.score - second.score
     top3_gap = ranked[2].score - ranked[3].score if len(ranked) >= 4 else 0
-
     data_ok_count = sum(1 for r in racers if "名前OK" in r.data_status and r.national_2 > 0)
     display_ok_count = sum(1 for r in racers if r.display_time > 0)
 
@@ -556,7 +492,6 @@ def race_confidence(racers: List[Racer]) -> Dict:
         confidence += 4
     if top.tenji_f:
         confidence -= 8
-
     if top_gap < 3:
         confidence -= 8
     if ranked[0].score - ranked[5].score < 18:
@@ -590,33 +525,27 @@ def race_confidence(racers: List[Racer]) -> Dict:
 
 def make_ai_table(racers: List[Racer]) -> pd.DataFrame:
     ranked = calculate_scores(racers)
-    rows = []
-
-    for i, r in enumerate(ranked, start=1):
-        rows.append({
-            "順位": i,
-            "艇": r.lane,
-            "選手": r.name,
-            "級別": r.klass,
-            "AI指数": r.score,
-            "展示": r.display_time,
-            "展示ST": f"{'F' if r.tenji_f else ''}{r.tenji_st:.2f}" if r.tenji_st else 0,
-            "平均ST": r.avg_st,
-            "全国2連率": r.national_2,
-            "当地2連率": r.local_2,
-            "モーター2連率": r.motor_2,
-            "ボート2連率": r.boat_2,
-            "データ状態": r.data_status,
-        })
-
-    return pd.DataFrame(rows)
+    return pd.DataFrame([{
+        "順位": i,
+        "艇": r.lane,
+        "選手": r.name,
+        "級別": r.klass,
+        "AI指数": r.score,
+        "展示": r.display_time,
+        "展示ST": f"{'F' if r.tenji_f else ''}{r.tenji_st:.2f}" if r.tenji_st else 0,
+        "平均ST": r.avg_st,
+        "全国2連率": r.national_2,
+        "当地2連率": r.local_2,
+        "モーター2連率": r.motor_2,
+        "ボート2連率": r.boat_2,
+        "データ状態": r.data_status,
+    } for i, r in enumerate(ranked, start=1)])
 
 
 def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic: Dict, odds: Dict[str, float]) -> float:
     a, b, c = combo
     r1, r2, r3 = racer_map[a], racer_map[b], racer_map[c]
-    key = f"{a}-{b}-{c}"
-    odd = odds.get(key, 0.0)
+    odd = odds.get(f"{a}-{b}-{c}", 0.0)
 
     s = r1.score * 1.00 + r2.score * 0.70 + r3.score * 0.48
 
@@ -624,15 +553,11 @@ def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic
         s += 7.0
 
     if tactic["展開"] == "イン逃げ濃厚":
-        if a == 1:
-            s += 14
-        else:
-            s -= 12
+        s += 14 if a == 1 else -12
         if b in [2, 3, 4]:
             s += 3
         if c in [2, 3, 4, 5]:
             s += 2
-
     elif tactic["展開"] == "1飛び警戒":
         if a == 1:
             s -= 9
@@ -640,7 +565,6 @@ def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic
             s += 8
         if 1 in [b, c]:
             s += 4
-
     elif tactic["展開"] == "穴期待":
         if a in [3, 4]:
             s += 7
@@ -661,7 +585,6 @@ def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic
     if a == 6 and r1.score < 95:
         s -= 10.0
 
-    # オッズが取れている時だけ補正。誤取得防止で未取得なら補正なし。
     if odd > 0:
         if 7.0 <= odd <= 35.0:
             s += 8.0
@@ -683,11 +606,9 @@ def generate_predictions(racers: List[Racer], odds: Dict[str, float], pick_count
     for combo in itertools.permutations([1, 2, 3, 4, 5, 6], 3):
         key = f"{combo[0]}-{combo[1]}-{combo[2]}"
         odd = odds.get(key, 0.0)
-        value = combo_score(combo, racer_map, tactic, odds)
-
         rows.append({
             "買い目": key,
-            "評価": round(value, 2),
+            "評価": combo_score(combo, racer_map, tactic, odds),
             "オッズ": odd if odd > 0 else "未取得",
         })
 
@@ -697,7 +618,6 @@ def generate_predictions(racers: List[Racer], odds: Dict[str, float], pick_count
     for i, row in df.iterrows():
         odd = row["オッズ"]
         odd_num = odd if isinstance(odd, float) else 0
-
         if i < 2:
             labels.append("熱🔥")
         elif i < 5:
@@ -708,7 +628,6 @@ def generate_predictions(racers: List[Racer], odds: Dict[str, float], pick_count
             labels.append("抑え")
 
     df["区分"] = labels
-
     conf = race_confidence(racers)["confidence"]
     df["勝負度"] = conf
     df["厚張りAI"] = ""
@@ -720,47 +639,41 @@ def generate_predictions(racers: List[Racer], odds: Dict[str, float], pick_count
 
     if preset == "的中率重視":
         return df.head(min(pick_count, 6))
-    elif preset == "標準":
-        return df.head(pick_count)
-    else:
+    if preset == "攻め":
         return df.head(max(pick_count, 12))
+    return df.head(pick_count)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def detect_today_venues(hd: str) -> List[str]:
     urls = [
         f"https://www.boatrace.jp/owpc/pc/race/index?hd={hd}",
         f"https://www.boatrace.jp/owpc/pc/race/index?hd={hd}&jcd=",
     ]
-
     found = set()
-
     for url in urls:
         try:
             html = fetch_html(url)
             soup = BeautifulSoup(html, "html.parser")
-
             for a in soup.find_all("a", href=True):
                 href = a.get("href", "")
                 txt = clean_text(a.get_text(" "))
                 m = re.search(r"jcd=(\d{2})", href)
                 if m:
                     jcd = m.group(1).zfill(2)
-                    if jcd in JCD_MAP:
-                        if "racelist" in href or "race" in href or JCD_MAP[jcd] in txt:
-                            found.add(jcd)
-
+                    if jcd in JCD_MAP and ("racelist" in href or "race" in href or JCD_MAP[jcd] in txt):
+                        found.add(jcd)
             text = clean_text(soup.get_text(" "))
             for jcd, place in JCD_MAP.items():
                 if place in text:
                     found.add(jcd)
-
         except Exception:
             pass
-
     return sorted(found)
 
 
-def analyze_single_race(jcd: str, rno: int, hd: str, use_before: bool, use_odds: bool, pick_count: int, preset: str) -> Dict:
+@st.cache_data(ttl=600, show_spinner=False)
+def analyze_single_race_cached(jcd: str, rno: int, hd: str, use_before: bool, use_odds: bool, pick_count: int, preset: str) -> Dict:
     place = JCD_MAP.get(jcd, jcd)
     racelist_url = make_url("racelist", str(rno), jcd, hd)
 
@@ -843,23 +756,20 @@ def run_single_race_view(url: str, use_before: bool, use_odds: bool, pick_count:
     racelist_url = make_url("racelist", rno, jcd, hd)
     before_url = make_url("beforeinfo", rno, jcd, hd)
 
-    with st.spinner("出走表を取得中..."):
-        racelist_html = fetch_html(racelist_url)
-        racers, meta = parse_racelist(racelist_html, place)
+    racelist_html = fetch_html(racelist_url)
+    racers, meta = parse_racelist(racelist_html, place)
 
     if use_before:
-        with st.spinner("直前情報を取得中..."):
-            try:
-                before_html = fetch_html(before_url)
-                parse_beforeinfo(before_html, racers)
-            except Exception as e:
-                st.warning(f"直前情報の取得に失敗しました: {e}")
+        try:
+            before_html = fetch_html(before_url)
+            parse_beforeinfo(before_html, racers)
+        except Exception as e:
+            st.warning(f"直前情報の取得に失敗しました: {e}")
 
     odds = {}
     odds_meta = {}
     if use_odds:
-        with st.spinner("3連単オッズを取得中..."):
-            odds, odds_meta = fetch_and_parse_odds3t(rno, jcd, hd)
+        odds, odds_meta = fetch_and_parse_odds3t(rno, jcd, hd)
 
     ai_df = make_ai_table(racers)
     pred_df = generate_predictions(racers, odds, pick_count, preset)
@@ -876,12 +786,6 @@ def run_single_race_view(url: str, use_before: bool, use_odds: bool, pick_count:
     col3.metric("本命", f"{conf['top_lane']}号艇")
 
     st.info(f"展開コメント：{tactic['コメント']}")
-
-    if use_odds:
-        if len(odds) > 0:
-            st.success(f"3連単オッズ：{len(odds)}件取得")
-        else:
-            st.info("3連単オッズ：未取得。人気順位の誤取得を避け、指数予想で実行しています。")
 
     st.markdown("### 指数表")
     st.dataframe(ai_df, width="stretch", hide_index=True)
@@ -907,10 +811,8 @@ def run_single_race_view(url: str, use_before: bool, use_odds: bool, pick_count:
 def init_venue_state(detected: List[str]):
     if "venue_selected" not in st.session_state:
         st.session_state["venue_selected"] = {jcd: (jcd in detected) for jcd in JCD_MAP.keys()}
-    else:
-        # 初回検出後、未選択状態になりすぎないように開催場だけON補正
-        if not any(st.session_state["venue_selected"].values()) and detected:
-            st.session_state["venue_selected"] = {jcd: (jcd in detected) for jcd in JCD_MAP.keys()}
+    elif not any(st.session_state["venue_selected"].values()) and detected:
+        st.session_state["venue_selected"] = {jcd: (jcd in detected) for jcd in JCD_MAP.keys()}
 
 
 def set_all_venues(value: bool):
@@ -954,8 +856,64 @@ def venue_checkbox_selector(detected: List[str]) -> List[str]:
     return [jcd for jcd, selected in st.session_state["venue_selected"].items() if selected]
 
 
-def run_all_races_screen(hd: str, use_before: bool, use_odds: bool, pick_count: int, preset: str):
-    st.markdown("### 今日の開催・全レースAI")
+def show_saved_results(min_conf: int, max_rows: int):
+    if "last_results_df" not in st.session_state or st.session_state["last_results_df"] is None:
+        st.info("まだ解析結果がありません。開催場を選んで「厳選AIを実行」を押してください。")
+        return
+
+    df_all = st.session_state["last_results_df"]
+    df_best = df_all[df_all["勝負度"] >= min_conf].sort_values(["勝負度", "本命指数"], ascending=False).head(max_rows)
+    df_hot = df_all[df_all["判定"].isin(["熱🔥", "厚張り候補"])].sort_values(["勝負度", "本命指数"], ascending=False)
+
+    tab1, tab2, tab3, tab4 = st.tabs(["全レース一覧", "本日の厳選レース", "熱🔥・厚張り", "開催場別"])
+
+    with tab1:
+        st.markdown("### 全レース一覧")
+        st.dataframe(df_all, width="stretch", hide_index=True)
+
+    with tab2:
+        st.markdown("### 本日の厳選レース")
+        if len(df_best) == 0:
+            st.info("条件に合うレースはありませんでした。最低勝負度を下げてください。")
+        else:
+            st.dataframe(df_best, width="stretch", hide_index=True)
+            hd = st.session_state.get("last_hd", "")
+            lines = [f"【本日の厳選レース】{hd}", ""]
+            for _, row in df_best.iterrows():
+                lines.append(
+                    f"{row['判定']}｜{row['レース']}｜勝負度 {row['勝負度']}%｜"
+                    f"展開 {row['展開']}｜本命 {row['本命']}｜候補 {row['買い目候補']}"
+                )
+            lines.append("")
+            lines.append("※指数・展示・成績・展開判定を中心に自動評価しています。")
+            lines.append("※指数表・印とは連動していない場合もございます。")
+            st.text_area("Note貼り付け用", value="\n".join(lines), height=300)
+
+    with tab3:
+        st.markdown("### 熱🔥・厚張り候補")
+        if len(df_hot) == 0:
+            st.info("熱🔥・厚張り候補はありませんでした。")
+        else:
+            st.dataframe(df_hot, width="stretch", hide_index=True)
+
+    with tab4:
+        st.markdown("### 開催場別")
+        place_choice = st.selectbox("開催場を選択", sorted(df_all["場"].unique().tolist()))
+        df_place = df_all[df_all["場"] == place_choice].sort_values(["R"])
+        df_place_best = df_place[df_place["勝負度"] >= min_conf].sort_values(["勝負度", "R"], ascending=[False, True])
+
+        st.markdown(f"#### {place_choice} 全レース")
+        st.dataframe(df_place, width="stretch", hide_index=True)
+
+        st.markdown(f"#### {place_choice} 厳選レース")
+        if len(df_place_best) == 0:
+            st.info("この開催場では条件に合う厳選レースがありません。")
+        else:
+            st.dataframe(df_place_best, width="stretch", hide_index=True)
+
+
+def run_selection_screen(hd: str, use_before: bool, use_odds: bool, pick_count: int, preset: str):
+    st.markdown("### 厳選AI")
 
     detected = detect_today_venues(hd)
 
@@ -979,7 +937,16 @@ def run_all_races_screen(hd: str, use_before: bool, use_odds: bool, pick_count: 
 
     st.info(f"選択中：{len(selected_jcds)}場 / {', '.join([JCD_MAP[j] for j in selected_jcds]) if selected_jcds else 'なし'}")
 
-    if st.button("全レースAIを実行", type="primary"):
+    col_run, col_clear = st.columns(2)
+    with col_run:
+        run_button = st.button("厳選AIを実行 / 再解析", type="primary")
+    with col_clear:
+        if st.button("履歴をクリア"):
+            st.session_state["last_results_df"] = None
+            st.session_state["last_hd"] = None
+            st.rerun()
+
+    if run_button:
         if not selected_jcds:
             st.warning("開催場を選んでください。")
             return
@@ -997,7 +964,7 @@ def run_all_races_screen(hd: str, use_before: bool, use_odds: bool, pick_count: 
                 progress.progress(min(1.0, count / max(total, 1)))
 
                 try:
-                    result = analyze_single_race(jcd, rno, hd, use_before, use_odds, pick_count, preset)
+                    result = analyze_single_race_cached(jcd, rno, hd, use_before, use_odds, pick_count, preset)
                     results.append(result)
                 except Exception:
                     continue
@@ -1010,57 +977,11 @@ def run_all_races_screen(hd: str, use_before: bool, use_odds: bool, pick_count: 
             return
 
         df_all = pd.DataFrame(results).sort_values(["場", "R"])
-        df_best = df_all[df_all["勝負度"] >= min_conf].sort_values(["勝負度", "本命指数"], ascending=False).head(max_rows)
-        df_hot = df_all[df_all["判定"].isin(["熱🔥", "厚張り候補"])].sort_values(["勝負度", "本命指数"], ascending=False)
+        st.session_state["last_results_df"] = df_all
+        st.session_state["last_hd"] = hd
+        st.success("解析結果を保存しました。予想画面に移動して戻っても残ります。")
 
-        tab1, tab2, tab3, tab4 = st.tabs(["全レース一覧", "本日の厳選レース", "熱🔥・厚張り", "開催場別"])
-
-        with tab1:
-            st.markdown("### 全レース一覧")
-            st.dataframe(df_all, width="stretch", hide_index=True)
-
-        with tab2:
-            st.markdown("### 本日の厳選レース")
-            if len(df_best) == 0:
-                st.info("条件に合うレースはありませんでした。最低勝負度を下げてください。")
-            else:
-                st.dataframe(df_best, width="stretch", hide_index=True)
-
-                lines = []
-                lines.append(f"【本日の厳選レース】{hd}")
-                lines.append("")
-                for _, row in df_best.iterrows():
-                    lines.append(
-                        f"{row['判定']}｜{row['レース']}｜勝負度 {row['勝負度']}%｜"
-                        f"展開 {row['展開']}｜本命 {row['本命']}｜候補 {row['買い目候補']}"
-                    )
-                lines.append("")
-                lines.append("※指数・展示・成績・展開判定を中心に自動評価しています。")
-                lines.append("※指数表・印とは連動していない場合もございます。")
-                st.text_area("Note貼り付け用", value="\n".join(lines), height=300)
-
-        with tab3:
-            st.markdown("### 熱🔥・厚張り候補")
-            if len(df_hot) == 0:
-                st.info("熱🔥・厚張り候補はありませんでした。")
-            else:
-                st.dataframe(df_hot, width="stretch", hide_index=True)
-
-        with tab4:
-            st.markdown("### 開催場別")
-
-            place_choice = st.selectbox("開催場を選択", sorted(df_all["場"].unique().tolist()))
-            df_place = df_all[df_all["場"] == place_choice].sort_values(["R"])
-            df_place_best = df_place[df_place["勝負度"] >= min_conf].sort_values(["勝負度", "R"], ascending=[False, True])
-
-            st.markdown(f"#### {place_choice} 全レース")
-            st.dataframe(df_place, width="stretch", hide_index=True)
-
-            st.markdown(f"#### {place_choice} 厳選レース")
-            if len(df_place_best) == 0:
-                st.info("この開催場では条件に合う厳選レースがありません。")
-            else:
-                st.dataframe(df_place_best, width="stretch", hide_index=True)
+    show_saved_results(min_conf, max_rows)
 
 
 def main():
@@ -1069,18 +990,21 @@ def main():
     st.title("🚤 BOATRACE AI")
     st.caption(APP_VERSION)
 
+    if "last_results_df" not in st.session_state:
+        st.session_state["last_results_df"] = None
+    if "last_hd" not in st.session_state:
+        st.session_state["last_hd"] = None
+
     today = datetime.now(JST).strftime("%Y%m%d")
 
     st.sidebar.header("共通設定")
     hd = st.sidebar.text_input("日付 hd", value=today)
+
+    st.sidebar.caption("軽量化したい場合は、直前情報OFF・巡回Rを絞るのがおすすめです。")
     use_before = st.sidebar.checkbox("直前情報を取得", value=True)
     use_odds = st.sidebar.checkbox("オッズ取得を試す", value=False)
 
-    preset = st.sidebar.radio(
-        "買い目プリセット",
-        ["的中率重視", "標準", "攻め"],
-        index=0,
-    )
+    preset = st.sidebar.radio("買い目プリセット", ["的中率重視", "標準", "攻め"], index=0)
 
     if preset == "的中率重視":
         default_count = 5
@@ -1092,20 +1016,19 @@ def main():
     pick_count = st.sidebar.slider("買い目表示点数", 3, 20, default_count)
     debug = st.sidebar.checkbox("デバッグ表示", value=False)
 
-    mode = st.radio(
-        "モード",
-        ["全レースAI・厳選レース", "単レース予想"],
-        horizontal=True,
-    )
+    mode = st.radio("モード", ["厳選AI", "予想"], horizontal=True)
 
-    if mode == "全レースAI・厳選レース":
-        run_all_races_screen(hd, use_before, use_odds, pick_count, preset)
+    if mode == "厳選AI":
+        run_selection_screen(hd, use_before, use_odds, pick_count, preset)
     else:
         default_url = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno=2&jcd=20&hd={hd}"
         url = st.text_input("BOATRACE公式 出走表URL", value=default_url)
 
         if st.button("AI予想を実行", type="primary"):
             run_single_race_view(url, use_before, use_odds, pick_count, preset, debug)
+
+        if st.session_state.get("last_results_df") is not None:
+            st.info("厳選AIの前回結果は保存されています。厳選AIに戻ると再解析なしで表示できます。")
 
 
 if __name__ == "__main__":
