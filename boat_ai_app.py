@@ -1,6 +1,6 @@
 # boat_ai_app.py
-# BOATRACE AI v9.1
-# 整理版：全レース一覧・開催場別厳選・本日の厳選・単レース予想
+# BOATRACE AI v9.2
+# 開催場チェックボックス化・全選択/全解除・UI整理版
 # GitHub + Streamlit Cloud 用
 
 import re
@@ -16,7 +16,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-APP_VERSION = "v9.1 整理版・全レース一覧/開催場別厳選/単レース予想"
+APP_VERSION = "v9.2 開催場チェックボックス化・UI整理版"
 
 JST = timezone(timedelta(hours=9))
 
@@ -141,7 +141,6 @@ def extract_event_name(html: str, place: str) -> str:
         title = title.strip(" -｜|")
         if 5 <= len(title) <= 80 and title not in ["G3", "ヴィーナスシリーズ", "ルーキーシリーズ"]:
             return title
-
     return ""
 
 
@@ -317,7 +316,6 @@ def parse_racelist(html: str, place: str) -> Tuple[List[Racer], Dict]:
     return [uniq[k] for k in sorted(uniq)], {
         "event_name": event_name,
         "method": method,
-        "raw_lines_sample": soup_lines(html)[:220],
     }
 
 
@@ -386,20 +384,17 @@ def fetch_and_parse_odds3t(rno: str, jcd: str, hd: str) -> Tuple[Dict[str, float
     try:
         html = fetch_html(url)
         odds = parse_decimal_odds_only(html)
-        text_sample = clean_text(BeautifulSoup(html, "html.parser").get_text("\n"))[:3000]
         return odds, {
             "odds_url": url,
             "odds_count": len(odds),
             "odds_sample": dict(list(odds.items())[:50]),
-            "odds_text_sample": text_sample,
-            "odds_warning": "人気順位の誤取得防止のため、明確に小数オッズと判定できるものだけ使用しています。",
+            "odds_warning": "人気順位の誤取得防止のため、小数オッズと判定できるものだけ使用しています。",
         }
     except Exception as e:
         return {}, {
             "odds_url": url,
             "odds_count": 0,
             "odds_sample": {},
-            "odds_text_sample": "",
             "odds_warning": str(e),
         }
 
@@ -653,7 +648,6 @@ def analyze_single_race(jcd: str, rno: int, hd: str, use_before: bool, use_odds:
 
     return {
         "場": place,
-        "jcd": jcd,
         "R": rno,
         "レース": f"{place}{rno}R",
         "勝負度": conf["confidence"],
@@ -770,8 +764,51 @@ def run_single_race_view(url: str, use_before: bool, use_odds: bool, pick_count:
         st.write(odds_meta.get("odds_sample", {}))
 
 
-def format_venue_options(jcds: List[str]) -> List[str]:
-    return [JCD_MAP[j] for j in jcds if j in JCD_MAP]
+def init_venue_state(detected: List[str]):
+    if "venue_selected" not in st.session_state:
+        st.session_state["venue_selected"] = {jcd: (jcd in detected) for jcd in JCD_MAP.keys()}
+
+
+def set_all_venues(value: bool):
+    st.session_state["venue_selected"] = {jcd: value for jcd in JCD_MAP.keys()}
+
+
+def set_detected_venues(detected: List[str]):
+    st.session_state["venue_selected"] = {jcd: (jcd in detected) for jcd in JCD_MAP.keys()}
+
+
+def venue_checkbox_selector(detected: List[str]) -> List[str]:
+    init_venue_state(detected)
+
+    st.markdown("### チェックする開催場")
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        if st.button("自動検出だけ選択"):
+            set_detected_venues(detected)
+            st.rerun()
+    with col_b:
+        if st.button("全選択"):
+            set_all_venues(True)
+            st.rerun()
+    with col_c:
+        if st.button("全解除"):
+            set_all_venues(False)
+            st.rerun()
+
+    cols = st.columns(4)
+    for idx, (jcd, place) in enumerate(JCD_MAP.items()):
+        with cols[idx % 4]:
+            mark = "（開催）" if jcd in detected else ""
+            current = st.session_state["venue_selected"].get(jcd, False)
+            st.session_state["venue_selected"][jcd] = st.checkbox(
+                f"{place}{mark}",
+                value=current,
+                key=f"venue_{jcd}",
+            )
+
+    selected = [jcd for jcd, selected in st.session_state["venue_selected"].items() if selected]
+    return selected
 
 
 def run_all_races_screen(hd: str, use_before: bool, use_odds: bool, pick_count: int):
@@ -781,18 +818,13 @@ def run_all_races_screen(hd: str, use_before: bool, use_odds: bool, pick_count: 
 
     if detected:
         st.success(f"開催場を自動検出：{len(detected)}場")
-        st.write(" / ".join(format_venue_options(detected)))
+        st.write(" / ".join([JCD_MAP[j] for j in detected]))
     else:
         st.warning("開催場の自動検出に失敗しました。手動で選んでください。")
 
-    all_place_options = list(JCD_MAP.values())
-    default_places = format_venue_options(detected)
+    selected_jcds = venue_checkbox_selector(detected)
 
-    selected_places = st.multiselect(
-        "チェックする開催場",
-        all_place_options,
-        default=default_places,
-    )
+    st.divider()
 
     col_a, col_b, col_c = st.columns(3)
     with col_a:
@@ -802,9 +834,9 @@ def run_all_races_screen(hd: str, use_before: bool, use_odds: bool, pick_count: 
     with col_c:
         race_range = st.slider("巡回R", 1, 12, (1, 12))
 
-    if st.button("全レースAIを実行", type="primary"):
-        selected_jcds = [PLACE_TO_JCD[p] for p in selected_places if p in PLACE_TO_JCD]
+    st.info(f"選択中：{len(selected_jcds)}場 / {', '.join([JCD_MAP[j] for j in selected_jcds]) if selected_jcds else 'なし'}")
 
+    if st.button("全レースAIを実行", type="primary"):
         if not selected_jcds:
             st.warning("開催場を選んでください。")
             return
@@ -866,21 +898,18 @@ def run_all_races_screen(hd: str, use_before: bool, use_odds: bool, pick_count: 
         with tab3:
             st.markdown("### 開催場別の厳選レース")
 
-            if len(df_all) == 0:
-                st.info("表示できるデータがありません。")
+            place_choice = st.selectbox("開催場を選択", sorted(df_all["場"].unique().tolist()))
+            df_place = df_all[df_all["場"] == place_choice].sort_values(["R"])
+            df_place_best = df_place[df_place["勝負度"] >= min_conf].sort_values(["勝負度", "R"], ascending=[False, True])
+
+            st.markdown(f"#### {place_choice} 全レース")
+            st.dataframe(df_place, width="stretch", hide_index=True)
+
+            st.markdown(f"#### {place_choice} 厳選レース")
+            if len(df_place_best) == 0:
+                st.info("この開催場では条件に合う厳選レースがありません。")
             else:
-                place_choice = st.selectbox("開催場を選択", sorted(df_all["場"].unique().tolist()))
-                df_place = df_all[df_all["場"] == place_choice].sort_values(["勝負度", "R"], ascending=[False, True])
-                df_place_best = df_place[df_place["勝負度"] >= min_conf]
-
-                st.markdown(f"#### {place_choice} 全レース")
-                st.dataframe(df_place, width="stretch", hide_index=True)
-
-                st.markdown(f"#### {place_choice} 厳選レース")
-                if len(df_place_best) == 0:
-                    st.info("この開催場では条件に合う厳選レースがありません。")
-                else:
-                    st.dataframe(df_place_best, width="stretch", hide_index=True)
+                st.dataframe(df_place_best, width="stretch", hide_index=True)
 
 
 def main():
