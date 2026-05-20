@@ -1,6 +1,6 @@
 # boat_ai_app.py
-# BOATRACE AI v8.0
-# 3連単オッズ120点取得強化版
+# BOATRACE AI v8.1
+# 3連単オッズ横持ちテーブル復元強化版
 # GitHub + Streamlit Cloud 用
 
 import re
@@ -15,7 +15,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-APP_VERSION = "v8.0 3連単オッズ120点取得強化版"
+APP_VERSION = "v8.1 3連単オッズ横持ち復元強化版"
 
 JCD_MAP = {
     "01": "桐生", "02": "戸田", "03": "江戸川", "04": "平和島", "05": "多摩川", "06": "浜名湖",
@@ -86,7 +86,7 @@ def safe_float(x, default=0.0) -> float:
 
 def safe_int(x, default=0) -> int:
     try:
-        x = clean_text(x).strip()
+        x = clean_text(x)
         if x in ["", "-", "－", "None", "nan"]:
             return default
         return int(float(x))
@@ -120,8 +120,7 @@ def soup_lines(html: str) -> List[str]:
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     text = soup.get_text("\n")
-    lines = [clean_text(x) for x in text.splitlines()]
-    return [x for x in lines if x]
+    return [clean_text(x) for x in text.splitlines() if clean_text(x)]
 
 
 def extract_event_name(html: str, place: str) -> str:
@@ -141,11 +140,10 @@ def extract_event_name(html: str, place: str) -> str:
     ng = ["G1", "G2", "G3", "SG", "ヴィーナスシリーズ", "ルーキーシリーズ", "一般戦", "出走表"]
     for tag in soup.find_all(["h1", "h2", "h3", "div", "p", "span"]):
         txt = clean_text(tag.get_text(" "))
-        if not txt or txt in ng:
-            continue
-        if any(k in txt for k in ["杯", "選手権", "グランプリ", "ダービー", "周年", "マンスリー"]):
-            if 5 <= len(txt) <= 80:
-                return txt
+        if txt and txt not in ng:
+            if any(k in txt for k in ["杯", "選手権", "グランプリ", "ダービー", "周年", "マンスリー"]):
+                if 5 <= len(txt) <= 80:
+                    return txt
     return ""
 
 
@@ -154,8 +152,7 @@ def cell_texts(row) -> List[str]:
 
 
 def extract_lane_from_text(text: str) -> int:
-    text = clean_text(text)
-    m = re.match(r"^([1-6])(?:\s|$|Image)", text)
+    m = re.match(r"^([1-6])(?:\s|$|Image)", clean_text(text))
     return int(m.group(1)) if m else 0
 
 
@@ -187,9 +184,7 @@ def extract_name_from_text(text: str) -> str:
 
 def extract_reg_class(text: str) -> Tuple[str, str]:
     m = re.search(r"(\d{4})\s*/\s*([AB][12])", text)
-    if m:
-        return m.group(1), m.group(2)
-    return "", "B1"
+    return (m.group(1), m.group(2)) if m else ("", "B1")
 
 
 def parse_stats_from_racer_text(text: str) -> Dict[str, float]:
@@ -242,14 +237,11 @@ def extract_motor_boat_no(text: str) -> Tuple[int, int]:
         if len(cands) >= 2:
             motor_no = motor_no or cands[-2]
             boat_no = boat_no or cands[-1]
-        elif len(cands) == 1:
-            boat_no = boat_no or cands[-1]
 
     return motor_no, boat_no
 
 
 def parse_racer_from_text(lane: int, text: str) -> Racer:
-    text = clean_text(text)
     _, klass = extract_reg_class(text)
     name = extract_name_from_text(text) or f"{lane}号艇"
     stats = parse_stats_from_racer_text(text)
@@ -448,6 +440,23 @@ def parse_odds_from_plain_text(text: str) -> Dict[str, float]:
     return odds
 
 
+def parse_script_embedded_odds(html: str) -> Dict[str, float]:
+    odds: Dict[str, float] = {}
+
+    for m in re.finditer(r'["\']?([1-6])[-_]?([1-6])[-_]?([1-6])["\']?\s*[:=]\s*["\']?(\d+\.\d+)["\']?', html):
+        a, b, c, v = m.groups()
+        if len({a, b, c}) == 3:
+            odds[f"{a}-{b}-{c}"] = safe_float(v)
+
+    for m in re.finditer(r'["\']([1-6]{3})["\']\s*[:=]\s*["\']?(\d+\.\d+)["\']?', html):
+        nums, v = m.groups()
+        a, b, c = nums[0], nums[1], nums[2]
+        if len({a, b, c}) == 3:
+            odds[f"{a}-{b}-{c}"] = safe_float(v)
+
+    return odds
+
+
 def parse_odds_from_table_cells(html: str) -> Dict[str, float]:
     odds: Dict[str, float] = {}
     soup = BeautifulSoup(html, "html.parser")
@@ -471,8 +480,7 @@ def parse_odds_from_table_cells(html: str) -> Dict[str, float]:
                     odds[key] = val
 
             for i in range(len(cells) - 3):
-                a, b, c = cells[i], cells[i + 1], cells[i + 2]
-                v = cells[i + 3]
+                a, b, c, v = cells[i], cells[i + 1], cells[i + 2], cells[i + 3]
                 if re.fullmatch(r"[1-6]", a) and re.fullmatch(r"[1-6]", b) and re.fullmatch(r"[1-6]", c):
                     if len({a, b, c}) == 3:
                         val = safe_float(v, 0.0)
@@ -497,100 +505,128 @@ def parse_odds_from_table_cells(html: str) -> Dict[str, float]:
     return odds
 
 
-def parse_boatrace_official_3t_matrix(html: str) -> Dict[str, float]:
+def parse_official_horizontal_odds(html: str) -> Dict[str, float]:
     """
-    v8.0追加：
-    BOATRACE公式3連単オッズのPC表は、
-    1着固定ごとに「2着 → 3着候補のオッズ」がマトリクス化される。
-    HTML本文を行分解して、各1着ブロックから20点ずつ復元を狙う。
+    v8.1追加。
+    BOATRACE公式PC版の3連単は、
+    横に複数ブロックが並ぶことがある。
+    例：
+    1着 1 の表と 1着 2 の表が同一行内で横並び
+    そのため、td群を3列/4列単位に分解して復元する。
     """
     odds: Dict[str, float] = {}
-    lines = soup_lines(html)
+    soup = BeautifulSoup(html, "html.parser")
 
-    # 余計な文言を除き、数字/オッズ候補だけを残す
-    useful = []
-    for line in lines:
-        x = clean_text(line)
-        if not x:
+    for table in soup.find_all("table"):
+        rows = []
+        for tr in table.find_all("tr"):
+            cells = []
+            for td in tr.find_all(["td", "th"]):
+                txt = clean_text(td.get_text("\n"))
+                colspan = safe_int(td.get("colspan", 1), 1)
+                rowspan = safe_int(td.get("rowspan", 1), 1)
+                if not txt:
+                    txt = ""
+                for _ in range(max(1, colspan)):
+                    cells.append(txt)
+            if cells:
+                rows.append(cells)
+
+        if not rows:
             continue
-        if x in ["3連単", "オッズ", "人気", "更新", "締切", "投票"]:
-            continue
-        useful.append(x)
 
-    # 1着ブロック候補を探す
-    # 公式は「1」「2」「3」「4」「5」「6」の後に大量の小数が出るケースがある
-    for first in range(1, 7):
-        # first固定のテーブル候補をHTML上から探す
-        soup = BeautifulSoup(html, "html.parser")
-        tables = soup.find_all("table")
+        # flattened解析
+        flat = [c for row in rows for c in row if c]
+        odds.update(parse_odds_from_plain_text(" ".join(flat)))
 
-        for table in tables:
-            txt = clean_text(table.get_text("\n"))
-            if not txt:
-                continue
+        # 横持ち：セル列から「艇番」「艇番」「オッズ」を拾う
+        for row in rows:
+            for i in range(len(row) - 2):
+                b = clean_text(row[i])
+                c = clean_text(row[i + 1])
+                v = clean_text(row[i + 2])
 
-            # table内に first が含まれていない場合はスキップしない。公式側はcaption外のことがあるため。
-            t_lines = [clean_text(x) for x in txt.splitlines() if clean_text(x)]
-            tokens = []
-            for ln in t_lines:
-                parts = re.findall(r"\b[1-6]\b|\d+\.\d+|欠場|不成立", ln)
-                tokens.extend(parts)
-
-            if len(tokens) < 10:
-                continue
-
-            # パターンA: first, second, third, odds が連続する
-            for i in range(len(tokens) - 3):
-                a, b, c, v = tokens[i], tokens[i + 1], tokens[i + 2], tokens[i + 3]
-                if a == str(first) and re.fullmatch(r"[1-6]", b) and re.fullmatch(r"[1-6]", c):
-                    if len({a, b, c}) == 3:
-                        val = safe_float(v, 0.0)
-                        if val > 0:
-                            odds[f"{a}-{b}-{c}"] = val
-
-            # パターンB: second, third, odds が並んでいて、firstは外側から推定
-            local = {}
-            for i in range(len(tokens) - 2):
-                b, c, v = tokens[i], tokens[i + 1], tokens[i + 2]
                 if re.fullmatch(r"[1-6]", b) and re.fullmatch(r"[1-6]", c):
-                    if len({str(first), b, c}) == 3:
-                        val = safe_float(v, 0.0)
-                        if val > 0:
-                            local[f"{first}-{b}-{c}"] = val
+                    val = safe_float(v, 0.0)
+                    if val <= 0:
+                        continue
 
-            # 1着固定20点に近い場合だけ採用
-            if 8 <= len(local) <= 20:
-                odds.update(local)
+                    # firstはこの行の左側、または近傍から推定
+                    candidates = []
+                    for j in range(max(0, i - 6), i):
+                        if re.fullmatch(r"[1-6]", clean_text(row[j])):
+                            candidates.append(int(row[j]))
+
+                    for first in candidates:
+                        if len({str(first), b, c}) == 3:
+                            odds[f"{first}-{b}-{c}"] = val
+
+        # 1着固定ブロックの復元
+        for first in range(1, 7):
+            text = clean_text(table.get_text("\n"))
+            if str(first) not in text:
+                continue
+
+            # 行ごとに「2着」「3着」「オッズ」らしき並びを取り出す
+            for row in rows:
+                tokens = []
+                for cell in row:
+                    parts = re.findall(r"\b[1-6]\b|\d+\.\d+", clean_text(cell))
+                    tokens.extend(parts)
+
+                if len(tokens) < 3:
+                    continue
+
+                # second, third, odds
+                for i in range(len(tokens) - 2):
+                    b, c, v = tokens[i], tokens[i + 1], tokens[i + 2]
+                    if re.fullmatch(r"[1-6]", b) and re.fullmatch(r"[1-6]", c):
+                        val = safe_float(v, 0.0)
+                        if val > 0 and len({str(first), b, c}) == 3:
+                            odds[f"{first}-{b}-{c}"] = val
 
     return odds
 
 
-def parse_script_embedded_odds(html: str) -> Dict[str, float]:
+def parse_official_block20_odds(html: str) -> Dict[str, float]:
     """
-    JS内に 123: 45.6 / "1-2-3":"45.6" のように埋まるケース対策。
+    1着固定ごとに20点ある前提で、テキスト順から復元を試みる。
+    ただし無理な推定値は入れない。
     """
     odds: Dict[str, float] = {}
+    text = clean_text(BeautifulSoup(html, "html.parser").get_text("\n"))
+    lines = [clean_text(x) for x in text.splitlines() if clean_text(x)]
 
-    for m in re.finditer(r'["\']?([1-6])[-_]?([1-6])[-_]?([1-6])["\']?\s*[:=]\s*["\']?(\d+\.\d+)["\']?', html):
-        a, b, c, v = m.groups()
-        if len({a, b, c}) == 3:
-            odds[f"{a}-{b}-{c}"] = safe_float(v)
+    for first in range(1, 7):
+        block_lines = []
+        capturing = False
 
-    for m in re.finditer(r'["\']([1-6]{3})["\']\s*[:=]\s*["\']?(\d+\.\d+)["\']?', html):
-        nums, v = m.groups()
-        a, b, c = nums[0], nums[1], nums[2]
-        if len({a, b, c}) == 3:
-            odds[f"{a}-{b}-{c}"] = safe_float(v)
+        for line in lines:
+            if re.fullmatch(str(first), line) or re.search(rf"1着\s*{first}", line):
+                capturing = True
+                block_lines = []
+                continue
 
-    return odds
+            if capturing and re.fullmatch(r"[1-6]", line) and line != str(first):
+                # 次のブロックの可能性があるが、公式構造が曖昧なので継続
+                pass
 
+            if capturing:
+                block_lines.append(line)
+                if len(block_lines) > 120:
+                    break
 
-def infer_missing_odds_from_partial(odds: Dict[str, float]) -> Dict[str, float]:
-    """
-    実オッズが一部しか取れない時の保険。
-    これは実オッズではないため、原則0扱い。
-    v8.0では勝手に推定値を入れず、空欄のままにする。
-    """
+        block_text = " ".join(block_lines)
+        tokens = re.findall(r"\b[1-6]\b|\d+\.\d+", block_text)
+
+        # second third odds の連続パターン
+        for i in range(len(tokens) - 2):
+            b, c, v = tokens[i], tokens[i + 1], tokens[i + 2]
+            if re.fullmatch(r"[1-6]", b) and re.fullmatch(r"[1-6]", c):
+                val = safe_float(v, 0.0)
+                if val > 0 and len({str(first), b, c}) == 3:
+                    odds[f"{first}-{b}-{c}"] = val
+
     return odds
 
 
@@ -610,14 +646,14 @@ def fetch_and_parse_odds3t(rno: str, jcd: str, hd: str) -> Tuple[Dict[str, float
     for url in urls:
         try:
             html = fetch_html(url)
-            html_sample = clean_text(BeautifulSoup(html, "html.parser").get_text("\n"))[:2000]
+            html_sample = clean_text(BeautifulSoup(html, "html.parser").get_text("\n"))[:2500]
 
             odds = {}
             odds.update(parse_script_embedded_odds(html))
             odds.update(parse_odds_from_plain_text(BeautifulSoup(html, "html.parser").get_text(" ")))
             odds.update(parse_odds_from_table_cells(html))
-            odds.update(parse_boatrace_official_3t_matrix(html))
-            odds = infer_missing_odds_from_partial(odds)
+            odds.update(parse_official_horizontal_odds(html))
+            odds.update(parse_official_block20_odds(html))
 
             if len(odds) > len(best_odds):
                 best_odds = odds
@@ -629,7 +665,7 @@ def fetch_and_parse_odds3t(rno: str, jcd: str, hd: str) -> Tuple[Dict[str, float
         "odds_url": best_url,
         "odds_count": len(best_odds),
         "odds_errors": errors,
-        "odds_sample": dict(list(best_odds.items())[:40]),
+        "odds_sample": dict(list(best_odds.items())[:60]),
         "odds_text_sample": html_sample,
     }
     return best_odds, meta
@@ -910,14 +946,11 @@ def main():
                 st.markdown("### 出走表抽出方式")
                 st.write(meta.get("method"))
 
-                st.markdown("### 出走表本文サンプル")
-                st.write(meta.get("raw_lines_sample", []))
-
                 st.markdown("### オッズ取得件数")
                 st.write(len(odds))
 
                 st.markdown("### オッズサンプル")
-                st.write(odds_meta.get("odds_sample", dict(list(odds.items())[:40])))
+                st.write(odds_meta.get("odds_sample", dict(list(odds.items())[:60])))
 
                 st.markdown("### オッズ本文サンプル")
                 st.text_area("オッズページ本文", value=odds_meta.get("odds_text_sample", ""), height=250)
