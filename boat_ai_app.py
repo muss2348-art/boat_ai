@@ -1,12 +1,13 @@
 # boat_ai_app.py
-# BOATRACE AI v8.4
-# 安定稼働版：出走表・直前情報・成績重視、オッズ誤取得防止
+# BOATRACE AI v9.0
+# 自動開催取得・全レース巡回・厳選AI版
 # GitHub + Streamlit Cloud 用
 
 import re
 import itertools
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple
 
 import requests
@@ -15,7 +16,9 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-APP_VERSION = "v8.4 安定稼働版・オッズ誤取得防止"
+APP_VERSION = "v9.0 自動開催取得・全レース厳選AI版"
+
+JST = timezone(timedelta(hours=9))
 
 JCD_MAP = {
     "01": "桐生", "02": "戸田", "03": "江戸川", "04": "平和島", "05": "多摩川", "06": "浜名湖",
@@ -82,11 +85,16 @@ def safe_float(x, default=0.0) -> float:
         return default
 
 
+@st.cache_data(ttl=300)
 def fetch_html(url: str) -> str:
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     r.encoding = r.apparent_encoding or "utf-8"
     return r.text
+
+
+def make_url(page: str, rno: str, jcd: str, hd: str) -> str:
+    return f"https://www.boatrace.jp/owpc/pc/race/{page}?rno={rno}&jcd={jcd}&hd={hd}"
 
 
 def parse_query_from_url(url: str) -> Tuple[str, str, str]:
@@ -97,10 +105,6 @@ def parse_query_from_url(url: str) -> Tuple[str, str, str]:
     if not rno or not jcd or not hd:
         raise ValueError("URLから rno / jcd / hd を取得できませんでした。")
     return rno, jcd, hd
-
-
-def make_url(page: str, rno: str, jcd: str, hd: str) -> str:
-    return f"https://www.boatrace.jp/owpc/pc/race/{page}?rno={rno}&jcd={jcd}&hd={hd}"
 
 
 def soup_lines(html: str) -> List[str]:
@@ -126,6 +130,8 @@ def extract_event_name(html: str, place: str) -> str:
 
     if title:
         title = re.sub(r"出走表.*", "", title)
+        title = re.sub(r"オッズ.*", "", title)
+        title = re.sub(r"直前情報.*", "", title)
         title = re.sub(r"【.*", "", title)
         title = title.replace("BOAT RACE", "")
         title = title.replace("ボートレース", "")
@@ -355,11 +361,6 @@ def parse_beforeinfo(html: str, racers: List[Racer]) -> None:
 
 
 def parse_decimal_odds_only(html: str) -> Dict[str, float]:
-    """
-    安定版：
-    人気順位の整数は絶対に使わない。
-    1-2-3 45.6 / 123 45.6 のように、買い目と小数オッズが明確な時だけ取得。
-    """
     odds: Dict[str, float] = {}
     text = clean_text(BeautifulSoup(html, "html.parser").get_text(" "))
 
@@ -379,7 +380,6 @@ def parse_decimal_odds_only(html: str) -> Dict[str, float]:
 
 def fetch_and_parse_odds3t(rno: str, jcd: str, hd: str) -> Tuple[Dict[str, float], Dict]:
     url = make_url("odds3t", rno, jcd, hd)
-
     try:
         html = fetch_html(url)
         odds = parse_decimal_odds_only(html)
@@ -430,6 +430,64 @@ def calculate_scores(racers: List[Racer]) -> List[Racer]:
     return sorted(racers, key=lambda x: x.score, reverse=True)
 
 
+def race_confidence(racers: List[Racer]) -> Dict:
+    ranked = calculate_scores(racers)
+
+    top = ranked[0]
+    second = ranked[1]
+    third = ranked[2]
+
+    top_gap = top.score - second.score
+    top3_gap = ranked[2].score - ranked[3].score if len(ranked) >= 4 else 0
+
+    data_ok_count = sum(1 for r in racers if "名前OK" in r.data_status and r.national_2 > 0)
+    display_ok_count = sum(1 for r in racers if r.display_time > 0)
+
+    confidence = 45
+    confidence += max(0, top.score - 85) * 0.65
+    confidence += top_gap * 2.0
+    confidence += max(0, top3_gap) * 0.8
+    confidence += data_ok_count * 1.2
+    confidence += display_ok_count * 1.0
+
+    if top.lane == 1:
+        confidence += 5
+    if top.klass == "A1":
+        confidence += 4
+    if top.tenji_f:
+        confidence -= 8
+
+    # 混戦ペナルティ
+    if top_gap < 3:
+        confidence -= 8
+    if ranked[0].score - ranked[5].score < 18:
+        confidence -= 5
+
+    confidence = round(max(0, min(100, confidence)), 1)
+
+    if confidence >= 85:
+        grade = "熱🔥"
+    elif confidence >= 76:
+        grade = "厚張り候補"
+    elif confidence >= 68:
+        grade = "厳選候補"
+    elif confidence >= 60:
+        grade = "穴期待"
+    else:
+        grade = "見送り寄り"
+
+    return {
+        "confidence": confidence,
+        "grade": grade,
+        "top_lane": top.lane,
+        "top_name": top.name,
+        "top_score": top.score,
+        "top_gap": round(top_gap, 1),
+        "data_ok": data_ok_count,
+        "display_ok": display_ok_count,
+    }
+
+
 def make_ai_table(racers: List[Racer]) -> pd.DataFrame:
     ranked = calculate_scores(racers)
 
@@ -444,16 +502,10 @@ def make_ai_table(racers: List[Racer]) -> pd.DataFrame:
             "展示": r.display_time,
             "展示ST": f"{'F' if r.tenji_f else ''}{r.tenji_st:.2f}" if r.tenji_st else 0,
             "平均ST": r.avg_st,
-            "全国勝率": r.national_win,
             "全国2連率": r.national_2,
-            "全国3連率": r.national_3,
-            "当地勝率": r.local_win,
             "当地2連率": r.local_2,
-            "当地3連率": r.local_3,
             "モーター2連率": r.motor_2,
-            "モーター3連率": r.motor_3,
             "ボート2連率": r.boat_2,
-            "ボート3連率": r.boat_3,
             "データ状態": r.data_status,
         })
 
@@ -529,19 +581,97 @@ def generate_predictions(racers: List[Racer], odds: Dict[str, float]) -> pd.Data
 
     df["区分"] = labels
 
-    top_gap = ranked[0].score - ranked[1].score if len(ranked) >= 2 else 0
-    confidence = min(100, max(0, 45 + top_gap * 2.2 + (ranked[0].score - 85) * 0.7))
-    confidence = round(confidence, 1)
-
-    df["勝負度"] = confidence
+    conf = race_confidence(racers)["confidence"]
+    df["勝負度"] = conf
     df["厚張りAI"] = ""
 
-    if confidence >= 72:
+    if conf >= 76:
         df.loc[df.index[:2], "厚張りAI"] = "候補"
-    if confidence >= 82:
+    if conf >= 85:
         df.loc[df.index[:1], "厚張りAI"] = "強"
 
     return df.head(14)
+
+
+def detect_today_venues(hd: str) -> List[str]:
+    urls = [
+        f"https://www.boatrace.jp/owpc/pc/race/index?hd={hd}",
+        f"https://www.boatrace.jp/owpc/pc/race/index?hd={hd}&jcd=",
+    ]
+
+    found = set()
+
+    for url in urls:
+        try:
+            html = fetch_html(url)
+            soup = BeautifulSoup(html, "html.parser")
+
+            for a in soup.find_all("a", href=True):
+                href = a.get("href", "")
+                txt = clean_text(a.get_text(" "))
+                m = re.search(r"jcd=(\d{2})", href)
+                if m:
+                    jcd = m.group(1).zfill(2)
+                    if jcd in JCD_MAP:
+                        # レースリンクか出走表リンクに限定
+                        if "racelist" in href or "race" in href or JCD_MAP[jcd] in txt:
+                            found.add(jcd)
+
+            # 本文側からも補助
+            text = clean_text(soup.get_text(" "))
+            for jcd, place in JCD_MAP.items():
+                if place in text:
+                    found.add(jcd)
+
+        except Exception:
+            pass
+
+    return sorted(found)
+
+
+def analyze_single_race(jcd: str, rno: int, hd: str, use_before: bool, use_odds: bool) -> Dict:
+    place = JCD_MAP.get(jcd, jcd)
+    racelist_url = make_url("racelist", str(rno), jcd, hd)
+
+    html = fetch_html(racelist_url)
+    racers, meta = parse_racelist(html, place)
+
+    if use_before:
+        try:
+            before_html = fetch_html(make_url("beforeinfo", str(rno), jcd, hd))
+            parse_beforeinfo(before_html, racers)
+        except Exception:
+            pass
+
+    odds = {}
+    if use_odds:
+        try:
+            odds, _ = fetch_and_parse_odds3t(str(rno), jcd, hd)
+        except Exception:
+            odds = {}
+
+    ai_df = make_ai_table(racers)
+    pred_df = generate_predictions(racers, odds)
+    conf = race_confidence(racers)
+
+    top_picks = " / ".join(pred_df.head(3)["買い目"].astype(str).tolist())
+
+    return {
+        "場": place,
+        "jcd": jcd,
+        "R": rno,
+        "レース": f"{place}{rno}R",
+        "勝負度": conf["confidence"],
+        "判定": conf["grade"],
+        "本命": f"{conf['top_lane']}号艇 {conf['top_name']}",
+        "本命指数": conf["top_score"],
+        "上位差": conf["top_gap"],
+        "展示取得": conf["display_ok"],
+        "データ取得": conf["data_ok"],
+        "買い目候補": top_picks,
+        "URL": racelist_url,
+        "event_name": meta.get("event_name", ""),
+    }
 
 
 def build_note_text(event_name: str, place: str, rno: str, ai_df: pd.DataFrame, pred_df: pd.DataFrame) -> str:
@@ -571,124 +701,193 @@ def build_note_text(event_name: str, place: str, rno: str, ai_df: pd.DataFrame, 
     return "\n".join(lines)
 
 
+def run_single_race_view(url: str, use_before: bool, use_odds: bool, debug: bool):
+    rno, jcd, hd = parse_query_from_url(url)
+    place = JCD_MAP.get(jcd, f"jcd={jcd}")
+
+    racelist_url = make_url("racelist", rno, jcd, hd)
+    before_url = make_url("beforeinfo", rno, jcd, hd)
+
+    with st.spinner("出走表を取得中..."):
+        racelist_html = fetch_html(racelist_url)
+        racers, meta = parse_racelist(racelist_html, place)
+
+    if use_before:
+        with st.spinner("直前情報を取得中..."):
+            try:
+                before_html = fetch_html(before_url)
+                parse_beforeinfo(before_html, racers)
+            except Exception as e:
+                st.warning(f"直前情報の取得に失敗しました: {e}")
+
+    odds = {}
+    odds_meta = {}
+    if use_odds:
+        with st.spinner("3連単オッズを取得中..."):
+            odds, odds_meta = fetch_and_parse_odds3t(rno, jcd, hd)
+
+    ai_df = make_ai_table(racers)
+    pred_df = generate_predictions(racers, odds)
+    conf = race_confidence(racers)
+
+    st.subheader(f"{place} {rno}R")
+    if meta.get("event_name"):
+        st.write(meta["event_name"])
+
+    name_ok = int((~ai_df["選手"].astype(str).str.contains("号艇")).sum())
+    st.success(f"選手名取得：{name_ok}/6艇 OK" if name_ok == 6 else f"選手名取得：{name_ok}/6艇")
+
+    before_ok = int((ai_df["展示"].astype(float) > 0).sum())
+    if use_before:
+        st.success(f"直前情報：展示タイム {before_ok}/6艇 OK" if before_ok == 6 else f"直前情報：展示タイム {before_ok}/6艇")
+
+    if use_odds:
+        if len(odds) > 0:
+            st.success(f"3連単オッズ：{len(odds)}件取得")
+        else:
+            st.info("3連単オッズ：未取得。人気順位の誤取得を避け、指数予想で実行しています。")
+
+    if conf["confidence"] >= 85:
+        st.error(f"勝負度：{conf['confidence']}%　{conf['grade']}")
+    elif conf["confidence"] >= 68:
+        st.warning(f"勝負度：{conf['confidence']}%　{conf['grade']}")
+    else:
+        st.info(f"勝負度：{conf['confidence']}%　{conf['grade']}")
+
+    st.markdown("### 指数表")
+    st.dataframe(ai_df, width="stretch", hide_index=True)
+
+    st.markdown("### 買い目AI")
+    st.dataframe(pred_df, width="stretch", hide_index=True)
+
+    st.markdown("### Note貼り付け用")
+    st.text_area(
+        "コピー用",
+        value=build_note_text(meta.get("event_name", ""), place, rno, ai_df, pred_df),
+        height=280,
+    )
+
+    if debug:
+        st.markdown("### デバッグ")
+        st.code(f"出走表: {racelist_url}\n直前情報: {before_url}")
+        st.write("抽出方式:", meta.get("method"))
+        st.write("オッズ件数:", len(odds))
+        st.write(odds_meta.get("odds_sample", {}))
+
+
 def main():
     st.set_page_config(page_title="BOATRACE AI", page_icon="🚤", layout="wide")
 
     st.title("🚤 BOATRACE AI")
     st.caption(APP_VERSION)
 
-    default_url = "https://www.boatrace.jp/owpc/pc/race/racelist?rno=2&jcd=20&hd=20260520"
-    url = st.text_input("BOATRACE公式 出走表URL", value=default_url)
+    mode = st.radio(
+        "モード",
+        ["今日の開催を自動取得して厳選", "単レースURLで予想"],
+        horizontal=True,
+    )
+
+    today = datetime.now(JST).strftime("%Y%m%d")
 
     col1, col2, col3 = st.columns(3)
-
     with col1:
-        use_before = st.checkbox("直前情報を取得", value=True)
+        hd = st.text_input("日付 hd", value=today)
     with col2:
-        use_odds = st.checkbox("3連単オッズを取得（取得できる時だけ反映）", value=True)
+        use_before = st.checkbox("直前情報を取得", value=True)
     with col3:
-        debug = st.checkbox("デバッグ表示", value=False)
+        use_odds = st.checkbox("オッズ取得を試す", value=False)
 
-    if st.button("AI予想を実行", type="primary"):
-        try:
-            rno, jcd, hd = parse_query_from_url(url)
-            place = JCD_MAP.get(jcd, f"jcd={jcd}")
+    debug = st.checkbox("デバッグ表示", value=False)
 
-            racelist_url = make_url("racelist", rno, jcd, hd)
-            before_url = make_url("beforeinfo", rno, jcd, hd)
+    if mode == "今日の開催を自動取得して厳選":
+        st.markdown("### 本日の全レース厳選AI")
 
-            with st.spinner("出走表を取得中..."):
-                racelist_html = fetch_html(racelist_url)
-                racers, meta = parse_racelist(racelist_html, place)
+        detected = detect_today_venues(hd)
+        default_labels = [f"{jcd} {JCD_MAP[jcd]}" for jcd in detected]
 
-            if use_before:
-                with st.spinner("直前情報を取得中..."):
+        if detected:
+            st.success(f"開催場を自動検出：{len(detected)}場")
+            st.write(" / ".join([JCD_MAP[j] for j in detected]))
+        else:
+            st.warning("開催場の自動検出に失敗しました。手動で選んでください。")
+
+        all_options = [f"{jcd} {name}" for jcd, name in JCD_MAP.items()]
+        selected_labels = st.multiselect(
+            "チェックする開催場",
+            all_options,
+            default=default_labels if default_labels else [],
+        )
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            min_conf = st.slider("表示する最低勝負度", 0, 100, 60)
+        with col_b:
+            max_rows = st.slider("最大表示レース数", 5, 50, 20)
+        with col_c:
+            race_range = st.slider("巡回R", 1, 12, (1, 12))
+
+        if st.button("全レースAIを実行", type="primary"):
+            selected_jcds = [x.split()[0] for x in selected_labels]
+
+            if not selected_jcds:
+                st.warning("開催場を選んでください。")
+                return
+
+            results = []
+            total = len(selected_jcds) * (race_range[1] - race_range[0] + 1)
+            progress = st.progress(0)
+            status = st.empty()
+
+            count = 0
+            for jcd in selected_jcds:
+                for rno in range(race_range[0], race_range[1] + 1):
+                    count += 1
+                    status.write(f"解析中：{JCD_MAP.get(jcd, jcd)} {rno}R")
+                    progress.progress(min(1.0, count / max(total, 1)))
+
                     try:
-                        before_html = fetch_html(before_url)
-                        parse_beforeinfo(before_html, racers)
-                    except Exception as e:
-                        st.warning(f"直前情報の取得に失敗しました: {e}")
+                        result = analyze_single_race(jcd, rno, hd, use_before, use_odds)
+                        results.append(result)
+                    except Exception:
+                        continue
 
-            odds = {}
-            odds_meta = {}
-            if use_odds:
-                with st.spinner("3連単オッズを取得中..."):
-                    odds, odds_meta = fetch_and_parse_odds3t(rno, jcd, hd)
+            progress.empty()
+            status.empty()
 
-            ai_df = make_ai_table(racers)
-            pred_df = generate_predictions(racers, odds)
+            if not results:
+                st.error("解析できるレースがありませんでした。")
+                return
 
-            st.subheader(f"{place} {rno}R")
+            df = pd.DataFrame(results)
+            df = df[df["勝負度"] >= min_conf]
+            df = df.sort_values(["勝負度", "本命指数"], ascending=False).head(max_rows)
 
-            if meta.get("event_name"):
-                st.write(meta["event_name"])
-
-            name_ok = int((~ai_df["選手"].astype(str).str.contains("号艇")).sum())
-            if name_ok == 6:
-                st.success("選手名取得：6/6艇 OK")
+            st.markdown("### 今日の厳選レース")
+            if len(df) == 0:
+                st.info("条件に合うレースはありませんでした。最低勝負度を下げてください。")
             else:
-                st.warning(f"選手名取得：{name_ok}/6艇。フォールバックが残っています。")
+                st.dataframe(df, width="stretch", hide_index=True)
 
-            before_ok = int((ai_df["展示"].astype(float) > 0).sum())
-            if use_before:
-                if before_ok == 6:
-                    st.success("直前情報：展示タイム 6/6艇 OK")
-                else:
-                    st.warning(f"直前情報：展示タイム {before_ok}/6艇")
+                st.markdown("### Note貼り付け用：厳選一覧")
+                lines = []
+                lines.append(f"【本日の厳選レース】{hd}")
+                lines.append("")
+                for _, row in df.iterrows():
+                    lines.append(
+                        f"{row['判定']}｜{row['レース']}｜勝負度 {row['勝負度']}%｜"
+                        f"本命 {row['本命']}｜候補 {row['買い目候補']}"
+                    )
+                lines.append("")
+                lines.append("※指数・展示・成績を中心に自動評価しています。")
+                lines.append("※指数表・印とは連動していない場合もございます。")
+                st.text_area("コピー用", value="\n".join(lines), height=280)
 
-            if use_odds:
-                if len(odds) > 0:
-                    st.success(f"3連単オッズ：{len(odds)}件取得")
-                else:
-                    st.info("3連単オッズ：未取得。人気順位の誤取得を避け、指数予想で実行しています。")
+    else:
+        default_url = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno=2&jcd=20&hd={hd}"
+        url = st.text_input("BOATRACE公式 出走表URL", value=default_url)
 
-            st.markdown("### 指数表")
-            st.dataframe(ai_df, width="stretch", hide_index=True)
-
-            st.markdown("### 買い目AI")
-            st.dataframe(pred_df, width="stretch", hide_index=True)
-
-            confidence = pred_df["勝負度"].iloc[0] if len(pred_df) else 0
-            if confidence >= 82:
-                st.error(f"勝負度：{confidence}%　厚張り候補あり")
-            elif confidence >= 72:
-                st.warning(f"勝負度：{confidence}%　厳選候補")
-            else:
-                st.info(f"勝負度：{confidence}%　通常評価")
-
-            st.markdown("### Note貼り付け用")
-            st.text_area(
-                "コピー用",
-                value=build_note_text(meta.get("event_name", ""), place, rno, ai_df, pred_df),
-                height=280,
-            )
-
-            if debug:
-                st.markdown("### デバッグURL")
-                st.code(
-                    f"出走表: {racelist_url}\n"
-                    f"直前情報: {before_url}\n"
-                    f"3連単オッズ: {odds_meta.get('odds_url', make_url('odds3t', rno, jcd, hd))}"
-                )
-
-                st.markdown("### 出走表抽出方式")
-                st.write(meta.get("method"))
-
-                st.markdown("### オッズ取得件数")
-                st.write(len(odds))
-
-                st.markdown("### オッズサンプル")
-                st.write(odds_meta.get("odds_sample", {}))
-
-                st.markdown("### オッズ取得メモ")
-                st.write(odds_meta.get("odds_warning", ""))
-
-                st.markdown("### オッズ本文サンプル")
-                st.text_area("オッズページ本文", value=odds_meta.get("odds_text_sample", ""), height=250)
-
-        except Exception as e:
-            st.error("処理中にエラーが発生しました。")
-            st.exception(e)
+        if st.button("AI予想を実行", type="primary"):
+            run_single_race_view(url, use_before, use_odds, debug)
 
 
 if __name__ == "__main__":
