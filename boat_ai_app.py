@@ -1,5 +1,6 @@
 # boat_ai_app.py
-# Boat Race AI v7.1
+# Boat Race AI v7.2
+# 日本時間 Today 修正版
 # 3連単オッズ取得・復元強化版
 # 出走表 / 直前情報 / 3連単オッズ
 # 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI / 買い目点数 1〜20点
@@ -7,7 +8,7 @@
 import re
 import math
 import itertools
-from datetime import date
+from datetime import datetime, timedelta, timezone
 
 import requests
 import pandas as pd
@@ -16,12 +17,19 @@ from bs4 import BeautifulSoup
 
 
 st.set_page_config(
-    page_title="Boat AI v7.1",
+    page_title="Boat AI v7.2",
     page_icon="🚤",
     layout="wide"
 )
 
 BASE_URL = "https://www.boatrace.jp/owpc/pc/race"
+
+JST = timezone(timedelta(hours=9))
+
+
+def today_jst():
+    return datetime.now(JST).date()
+
 
 JCD_MAP = {
     "桐生": "01", "戸田": "02", "江戸川": "03", "平和島": "04",
@@ -53,6 +61,8 @@ def safe_get(url):
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
     try:
         r = requests.get(url, headers=headers, timeout=15)
@@ -83,10 +93,6 @@ def default_columns():
         "モーター", "ボート", "平均ST", "データ状態"
     ]
 
-
-# =====================================================
-# 出走表
-# =====================================================
 
 def default_boat_row(waku, status="出走表取得弱い"):
     return {
@@ -384,10 +390,6 @@ def parse_racelist(html):
     return pd.DataFrame(final_rows)
 
 
-# =====================================================
-# 直前情報
-# =====================================================
-
 def parse_beforeinfo(html):
     base = pd.DataFrame([
         {"艇": i, "展示": 0.0, "展示ST": 0.18, "進入": i, "直前状態": "未取得"}
@@ -423,10 +425,6 @@ def parse_beforeinfo(html):
     return base
 
 
-# =====================================================
-# 3連単オッズ v7.1
-# =====================================================
-
 def all_3t_combos():
     return [f"{a}-{b}-{c}" for a, b, c in itertools.permutations([1, 2, 3, 4, 5, 6], 3)]
 
@@ -450,7 +448,6 @@ def parse_odds3t(html):
     df = df.dropna(subset=["オッズ"])
     df = df[(df["オッズ"] > 0) & (df["オッズ"] < 9999)]
 
-    # 同じ買い目が複数あったら、現実的に低すぎない最初の値を優先
     df = df.sort_values(["買い目", "取得優先"], ascending=[True, True])
     df = df.drop_duplicates("買い目", keep="first")
 
@@ -513,10 +510,8 @@ def parse_odds_table_restore(html):
 
         text = " ".join(flat)
 
-        # まず明示的な 1-2-3 12.3 / 123 12.3
         rows.extend(parse_odds_explicit_combo(text))
 
-        # 公式表はオッズだけが大量に並ぶケースがある
         odds_values = []
         for s in flat:
             found = re.findall(r"\d+\.\d+", s)
@@ -525,7 +520,6 @@ def parse_odds_table_restore(html):
                 if 1.0 <= v <= 9999:
                     odds_values.append(v)
 
-        # 120点分以上あれば、公式の標準順に割り当てる
         if len(odds_values) >= 80:
             combos = all_3t_combos()
             limit = min(len(odds_values), len(combos))
@@ -538,7 +532,6 @@ def parse_odds_table_restore(html):
                     "取得優先": 3,
                 })
 
-        # 1 2 3 12.3 のトークン分割にも対応
         tokens = []
         for s in flat:
             tokens.extend(re.findall(r"[1-6]|\d+\.\d+", s))
@@ -566,7 +559,6 @@ def parse_odds_raw_restore(html):
     rows = []
     raw = clean_text(html)
 
-    # odds3tページ内にオッズの小数が大量にある場合、順番復元を試す
     odds_values = []
 
     for x in re.findall(r">\s*(\d+\.\d+)\s*<", raw):
@@ -586,7 +578,6 @@ def parse_odds_raw_restore(html):
                 "取得優先": 4,
             })
 
-    # script内などの広め探索
     patterns = [
         r"([1-6])[-_–]([1-6])[-_–]([1-6])[^0-9]{0,10}(\d+\.\d+)",
         r"\b([1-6]{3})\b[^0-9]{0,10}(\d+\.\d+)",
@@ -641,10 +632,6 @@ def make_fallback_odds(power):
 
     return pd.DataFrame(rows)
 
-
-# =====================================================
-# AI LOGIC
-# =====================================================
 
 def grade_score(g):
     return {"A1": 18, "A2": 12, "B1": 5, "B2": 1}.get(str(g), 5)
@@ -823,20 +810,18 @@ def heavy_ai(df):
     return out.sort_values("厚張り指数", ascending=False).head(3).reset_index(drop=True)
 
 
-# =====================================================
-# UI
-# =====================================================
-
-st.title("🚤 Boat Race AI v7.1")
-st.caption("3連単オッズ復元強化版 / 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI")
+st.title("🚤 Boat Race AI v7.2")
+st.caption("日本時間Today修正版 / 3連単オッズ復元強化版 / 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI")
 
 with st.sidebar:
     st.header("設定")
 
+    st.caption(f"日本時間の今日：{today_jst().strftime('%Y/%m/%d')}")
+
     place = st.selectbox("場", list(JCD_MAP.keys()))
     jcd = JCD_MAP[place]
 
-    race_date = st.date_input("日付", value=date.today())
+    race_date = st.date_input("日付", value=today_jst())
     hd = race_date.strftime("%Y%m%d")
 
     race_no = st.number_input("レース", min_value=1, max_value=12, value=1)
@@ -863,6 +848,7 @@ if run:
     before = parse_beforeinfo(htmls.get("直前情報"))
 
     st.subheader(f"{place} {int(race_no)}R")
+    st.caption(f"取得対象日：{hd}")
 
     with st.expander("取得URL"):
         for k, v in urls.items():
