@@ -1,6 +1,6 @@
 # boat_ai_app.py
-# BOATRACE AI v8.1
-# 3連単オッズ横持ちテーブル復元強化版
+# BOATRACE AI v8.2
+# 3連単オッズ本文マトリクス解析追加版
 # GitHub + Streamlit Cloud 用
 
 import re
@@ -15,7 +15,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-APP_VERSION = "v8.1 3連単オッズ横持ち復元強化版"
+APP_VERSION = "v8.2 3連単オッズ本文マトリクス解析追加版"
 
 JCD_MAP = {
     "01": "桐生", "02": "戸田", "03": "江戸川", "04": "平和島", "05": "多摩川", "06": "浜名湖",
@@ -505,127 +505,81 @@ def parse_odds_from_table_cells(html: str) -> Dict[str, float]:
     return odds
 
 
-def parse_official_horizontal_odds(html: str) -> Dict[str, float]:
+def parse_boatrace_text_matrix_3t(html: str) -> Dict[str, float]:
     """
-    v8.1追加。
-    BOATRACE公式PC版の3連単は、
-    横に複数ブロックが並ぶことがある。
-    例：
-    1着 1 の表と 1着 2 の表が同一行内で横並び
-    そのため、td群を3列/4列単位に分解して復元する。
+    v8.2本命ロジック。
+    BOATRACE公式3連単オッズ本文は、
+    6艇分が横並びで以下のように並ぶ。
+
+    2 3 72.7 / 1 3 97.6 / 1 2 240.1 / ...
+    1行 = 6艇分 × (2着, 3着, オッズ) = 18トークン
+    それを20行分読むと 120点。
     """
     odds: Dict[str, float] = {}
-    soup = BeautifulSoup(html, "html.parser")
+    lines = soup_lines(html)
 
-    for table in soup.find_all("table"):
-        rows = []
-        for tr in table.find_all("tr"):
-            cells = []
-            for td in tr.find_all(["td", "th"]):
-                txt = clean_text(td.get_text("\n"))
-                colspan = safe_int(td.get("colspan", 1), 1)
-                rowspan = safe_int(td.get("rowspan", 1), 1)
-                if not txt:
-                    txt = ""
-                for _ in range(max(1, colspan)):
-                    cells.append(txt)
-            if cells:
-                rows.append(cells)
+    try:
+        start = lines.index("3連単オッズ") + 1
+    except ValueError:
+        return odds
 
-        if not rows:
+    end = len(lines)
+    for i, line in enumerate(lines[start:], start=start):
+        if "締切時オッズは" in line:
+            end = i
+            break
+
+    block = lines[start:end]
+
+    nums = []
+    for x in block:
+        if re.fullmatch(r"[1-6]", x):
+            nums.append(x)
+        elif re.fullmatch(r"\d+\.\d+", x):
+            nums.append(x)
+
+    best = []
+    for offset in range(0, min(30, len(nums))):
+        remain = nums[offset:]
+        if len(remain) < 360:
             continue
 
-        # flattened解析
-        flat = [c for row in rows for c in row if c]
-        odds.update(parse_odds_from_plain_text(" ".join(flat)))
+        sample = remain[:18]
+        ok = True
+        for j in range(0, 18, 3):
+            if not re.fullmatch(r"[1-6]", sample[j]):
+                ok = False
+            if not re.fullmatch(r"[1-6]", sample[j + 1]):
+                ok = False
+            if not re.fullmatch(r"\d+\.\d+", sample[j + 2]):
+                ok = False
 
-        # 横持ち：セル列から「艇番」「艇番」「オッズ」を拾う
-        for row in rows:
-            for i in range(len(row) - 2):
-                b = clean_text(row[i])
-                c = clean_text(row[i + 1])
-                v = clean_text(row[i + 2])
+        if ok:
+            best = remain
+            break
 
-                if re.fullmatch(r"[1-6]", b) and re.fullmatch(r"[1-6]", c):
-                    val = safe_float(v, 0.0)
-                    if val <= 0:
-                        continue
+    if not best:
+        return odds
 
-                    # firstはこの行の左側、または近傍から推定
-                    candidates = []
-                    for j in range(max(0, i - 6), i):
-                        if re.fullmatch(r"[1-6]", clean_text(row[j])):
-                            candidates.append(int(row[j]))
+    firsts = [1, 2, 3, 4, 5, 6]
+    rows = [best[i:i + 18] for i in range(0, min(len(best), 360), 18)]
 
-                    for first in candidates:
-                        if len({str(first), b, c}) == 3:
-                            odds[f"{first}-{b}-{c}"] = val
+    for row in rows:
+        if len(row) < 18:
+            continue
 
-        # 1着固定ブロックの復元
-        for first in range(1, 7):
-            text = clean_text(table.get_text("\n"))
-            if str(first) not in text:
-                continue
+        for col, first in enumerate(firsts):
+            i = col * 3
+            second = row[i]
+            third = row[i + 1]
+            val = safe_float(row[i + 2], 0.0)
 
-            # 行ごとに「2着」「3着」「オッズ」らしき並びを取り出す
-            for row in rows:
-                tokens = []
-                for cell in row:
-                    parts = re.findall(r"\b[1-6]\b|\d+\.\d+", clean_text(cell))
-                    tokens.extend(parts)
-
-                if len(tokens) < 3:
-                    continue
-
-                # second, third, odds
-                for i in range(len(tokens) - 2):
-                    b, c, v = tokens[i], tokens[i + 1], tokens[i + 2]
-                    if re.fullmatch(r"[1-6]", b) and re.fullmatch(r"[1-6]", c):
-                        val = safe_float(v, 0.0)
-                        if val > 0 and len({str(first), b, c}) == 3:
-                            odds[f"{first}-{b}-{c}"] = val
-
-    return odds
-
-
-def parse_official_block20_odds(html: str) -> Dict[str, float]:
-    """
-    1着固定ごとに20点ある前提で、テキスト順から復元を試みる。
-    ただし無理な推定値は入れない。
-    """
-    odds: Dict[str, float] = {}
-    text = clean_text(BeautifulSoup(html, "html.parser").get_text("\n"))
-    lines = [clean_text(x) for x in text.splitlines() if clean_text(x)]
-
-    for first in range(1, 7):
-        block_lines = []
-        capturing = False
-
-        for line in lines:
-            if re.fullmatch(str(first), line) or re.search(rf"1着\s*{first}", line):
-                capturing = True
-                block_lines = []
-                continue
-
-            if capturing and re.fullmatch(r"[1-6]", line) and line != str(first):
-                # 次のブロックの可能性があるが、公式構造が曖昧なので継続
-                pass
-
-            if capturing:
-                block_lines.append(line)
-                if len(block_lines) > 120:
-                    break
-
-        block_text = " ".join(block_lines)
-        tokens = re.findall(r"\b[1-6]\b|\d+\.\d+", block_text)
-
-        # second third odds の連続パターン
-        for i in range(len(tokens) - 2):
-            b, c, v = tokens[i], tokens[i + 1], tokens[i + 2]
-            if re.fullmatch(r"[1-6]", b) and re.fullmatch(r"[1-6]", c):
-                val = safe_float(v, 0.0)
-                if val > 0 and len({str(first), b, c}) == 3:
-                    odds[f"{first}-{b}-{c}"] = val
+            if re.fullmatch(r"[1-6]", second) and re.fullmatch(r"[1-6]", third) and val > 0:
+                a = str(first)
+                b = second
+                c = third
+                if len({a, b, c}) == 3:
+                    odds[f"{a}-{b}-{c}"] = val
 
     return odds
 
@@ -646,14 +600,13 @@ def fetch_and_parse_odds3t(rno: str, jcd: str, hd: str) -> Tuple[Dict[str, float
     for url in urls:
         try:
             html = fetch_html(url)
-            html_sample = clean_text(BeautifulSoup(html, "html.parser").get_text("\n"))[:2500]
+            html_sample = clean_text(BeautifulSoup(html, "html.parser").get_text("\n"))[:3000]
 
             odds = {}
             odds.update(parse_script_embedded_odds(html))
             odds.update(parse_odds_from_plain_text(BeautifulSoup(html, "html.parser").get_text(" ")))
             odds.update(parse_odds_from_table_cells(html))
-            odds.update(parse_official_horizontal_odds(html))
-            odds.update(parse_official_block20_odds(html))
+            odds.update(parse_boatrace_text_matrix_3t(html))
 
             if len(odds) > len(best_odds):
                 best_odds = odds
@@ -665,7 +618,7 @@ def fetch_and_parse_odds3t(rno: str, jcd: str, hd: str) -> Tuple[Dict[str, float
         "odds_url": best_url,
         "odds_count": len(best_odds),
         "odds_errors": errors,
-        "odds_sample": dict(list(best_odds.items())[:60]),
+        "odds_sample": dict(list(best_odds.items())[:80]),
         "odds_text_sample": html_sample,
     }
     return best_odds, meta
@@ -950,7 +903,7 @@ def main():
                 st.write(len(odds))
 
                 st.markdown("### オッズサンプル")
-                st.write(odds_meta.get("odds_sample", dict(list(odds.items())[:60])))
+                st.write(odds_meta.get("odds_sample", dict(list(odds.items())[:80])))
 
                 st.markdown("### オッズ本文サンプル")
                 st.text_area("オッズページ本文", value=odds_meta.get("odds_text_sample", ""), height=250)
