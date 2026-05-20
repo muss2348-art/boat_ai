@@ -1,6 +1,6 @@
 # boat_ai_app.py
-# BOATRACE AI v9.0
-# 自動開催取得・全レース巡回・厳選AI版
+# BOATRACE AI v9.1
+# 整理版：全レース一覧・開催場別厳選・本日の厳選・単レース予想
 # GitHub + Streamlit Cloud 用
 
 import re
@@ -16,7 +16,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-APP_VERSION = "v9.0 自動開催取得・全レース厳選AI版"
+APP_VERSION = "v9.1 整理版・全レース一覧/開催場別厳選/単レース予想"
 
 JST = timezone(timedelta(hours=9))
 
@@ -26,6 +26,8 @@ JCD_MAP = {
     "13": "尼崎", "14": "鳴門", "15": "丸亀", "16": "児島", "17": "宮島", "18": "徳山",
     "19": "下関", "20": "若松", "21": "芦屋", "22": "福岡", "23": "唐津", "24": "大村",
 }
+
+PLACE_TO_JCD = {v: k for k, v in JCD_MAP.items()}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -380,6 +382,7 @@ def parse_decimal_odds_only(html: str) -> Dict[str, float]:
 
 def fetch_and_parse_odds3t(rno: str, jcd: str, hd: str) -> Tuple[Dict[str, float], Dict]:
     url = make_url("odds3t", rno, jcd, hd)
+
     try:
         html = fetch_html(url)
         odds = parse_decimal_odds_only(html)
@@ -432,10 +435,8 @@ def calculate_scores(racers: List[Racer]) -> List[Racer]:
 
 def race_confidence(racers: List[Racer]) -> Dict:
     ranked = calculate_scores(racers)
-
     top = ranked[0]
     second = ranked[1]
-    third = ranked[2]
 
     top_gap = top.score - second.score
     top3_gap = ranked[2].score - ranked[3].score if len(ranked) >= 4 else 0
@@ -457,7 +458,6 @@ def race_confidence(racers: List[Racer]) -> Dict:
     if top.tenji_f:
         confidence -= 8
 
-    # 混戦ペナルティ
     if top_gap < 3:
         confidence -= 8
     if ranked[0].score - ranked[5].score < 18:
@@ -490,8 +490,8 @@ def race_confidence(racers: List[Racer]) -> Dict:
 
 def make_ai_table(racers: List[Racer]) -> pd.DataFrame:
     ranked = calculate_scores(racers)
-
     rows = []
+
     for i, r in enumerate(ranked, start=1):
         rows.append({
             "順位": i,
@@ -537,11 +537,10 @@ def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer]) -> flo
     return round(s, 2)
 
 
-def generate_predictions(racers: List[Racer], odds: Dict[str, float]) -> pd.DataFrame:
-    ranked = calculate_scores(racers)
+def generate_predictions(racers: List[Racer], odds: Dict[str, float], pick_count: int = 10) -> pd.DataFrame:
     racer_map = {r.lane: r for r in racers}
-
     rows = []
+
     for combo in itertools.permutations([1, 2, 3, 4, 5, 6], 3):
         key = f"{combo[0]}-{combo[1]}-{combo[2]}"
         odd = odds.get(key, 0.0)
@@ -590,7 +589,7 @@ def generate_predictions(racers: List[Racer], odds: Dict[str, float]) -> pd.Data
     if conf >= 85:
         df.loc[df.index[:1], "厚張りAI"] = "強"
 
-    return df.head(14)
+    return df.head(pick_count)
 
 
 def detect_today_venues(hd: str) -> List[str]:
@@ -613,11 +612,9 @@ def detect_today_venues(hd: str) -> List[str]:
                 if m:
                     jcd = m.group(1).zfill(2)
                     if jcd in JCD_MAP:
-                        # レースリンクか出走表リンクに限定
                         if "racelist" in href or "race" in href or JCD_MAP[jcd] in txt:
                             found.add(jcd)
 
-            # 本文側からも補助
             text = clean_text(soup.get_text(" "))
             for jcd, place in JCD_MAP.items():
                 if place in text:
@@ -629,7 +626,7 @@ def detect_today_venues(hd: str) -> List[str]:
     return sorted(found)
 
 
-def analyze_single_race(jcd: str, rno: int, hd: str, use_before: bool, use_odds: bool) -> Dict:
+def analyze_single_race(jcd: str, rno: int, hd: str, use_before: bool, use_odds: bool, pick_count: int) -> Dict:
     place = JCD_MAP.get(jcd, jcd)
     racelist_url = make_url("racelist", str(rno), jcd, hd)
 
@@ -650,10 +647,8 @@ def analyze_single_race(jcd: str, rno: int, hd: str, use_before: bool, use_odds:
         except Exception:
             odds = {}
 
-    ai_df = make_ai_table(racers)
-    pred_df = generate_predictions(racers, odds)
+    pred_df = generate_predictions(racers, odds, pick_count)
     conf = race_confidence(racers)
-
     top_picks = " / ".join(pred_df.head(3)["買い目"].astype(str).tolist())
 
     return {
@@ -670,7 +665,7 @@ def analyze_single_race(jcd: str, rno: int, hd: str, use_before: bool, use_odds:
         "データ取得": conf["data_ok"],
         "買い目候補": top_picks,
         "URL": racelist_url,
-        "event_name": meta.get("event_name", ""),
+        "開催名": meta.get("event_name", ""),
     }
 
 
@@ -691,7 +686,7 @@ def build_note_text(event_name: str, place: str, rno: str, ai_df: pd.DataFrame, 
 
     lines.append("")
     lines.append("【買い目】")
-    for _, row in pred_df.head(8).iterrows():
+    for _, row in pred_df.iterrows():
         odds_txt = f"（{row['オッズ']}倍）" if isinstance(row["オッズ"], float) else "（オッズ未反映）"
         lines.append(f"{row['区分']} {row['買い目']} {odds_txt}")
 
@@ -701,7 +696,7 @@ def build_note_text(event_name: str, place: str, rno: str, ai_df: pd.DataFrame, 
     return "\n".join(lines)
 
 
-def run_single_race_view(url: str, use_before: bool, use_odds: bool, debug: bool):
+def run_single_race_view(url: str, use_before: bool, use_odds: bool, pick_count: int, debug: bool):
     rno, jcd, hd = parse_query_from_url(url)
     place = JCD_MAP.get(jcd, f"jcd={jcd}")
 
@@ -727,7 +722,7 @@ def run_single_race_view(url: str, use_before: bool, use_odds: bool, debug: bool
             odds, odds_meta = fetch_and_parse_odds3t(rno, jcd, hd)
 
     ai_df = make_ai_table(racers)
-    pred_df = generate_predictions(racers, odds)
+    pred_df = generate_predictions(racers, odds, pick_count)
     conf = race_confidence(racers)
 
     st.subheader(f"{place} {rno}R")
@@ -775,104 +770,90 @@ def run_single_race_view(url: str, use_before: bool, use_odds: bool, debug: bool
         st.write(odds_meta.get("odds_sample", {}))
 
 
-def main():
-    st.set_page_config(page_title="BOATRACE AI", page_icon="🚤", layout="wide")
+def format_venue_options(jcds: List[str]) -> List[str]:
+    return [JCD_MAP[j] for j in jcds if j in JCD_MAP]
 
-    st.title("🚤 BOATRACE AI")
-    st.caption(APP_VERSION)
 
-    mode = st.radio(
-        "モード",
-        ["今日の開催を自動取得して厳選", "単レースURLで予想"],
-        horizontal=True,
+def run_all_races_screen(hd: str, use_before: bool, use_odds: bool, pick_count: int):
+    st.markdown("### 今日の開催・全レースAI")
+
+    detected = detect_today_venues(hd)
+
+    if detected:
+        st.success(f"開催場を自動検出：{len(detected)}場")
+        st.write(" / ".join(format_venue_options(detected)))
+    else:
+        st.warning("開催場の自動検出に失敗しました。手動で選んでください。")
+
+    all_place_options = list(JCD_MAP.values())
+    default_places = format_venue_options(detected)
+
+    selected_places = st.multiselect(
+        "チェックする開催場",
+        all_place_options,
+        default=default_places,
     )
 
-    today = datetime.now(JST).strftime("%Y%m%d")
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        min_conf = st.slider("厳選表示の最低勝負度", 0, 100, 60)
+    with col_b:
+        max_rows = st.slider("厳選最大表示数", 5, 80, 30)
+    with col_c:
+        race_range = st.slider("巡回R", 1, 12, (1, 12))
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        hd = st.text_input("日付 hd", value=today)
-    with col2:
-        use_before = st.checkbox("直前情報を取得", value=True)
-    with col3:
-        use_odds = st.checkbox("オッズ取得を試す", value=False)
+    if st.button("全レースAIを実行", type="primary"):
+        selected_jcds = [PLACE_TO_JCD[p] for p in selected_places if p in PLACE_TO_JCD]
 
-    debug = st.checkbox("デバッグ表示", value=False)
+        if not selected_jcds:
+            st.warning("開催場を選んでください。")
+            return
 
-    if mode == "今日の開催を自動取得して厳選":
-        st.markdown("### 本日の全レース厳選AI")
+        results = []
+        total = len(selected_jcds) * (race_range[1] - race_range[0] + 1)
+        progress = st.progress(0)
+        status = st.empty()
 
-        detected = detect_today_venues(hd)
-        default_labels = [f"{jcd} {JCD_MAP[jcd]}" for jcd in detected]
+        count = 0
+        for jcd in selected_jcds:
+            for rno in range(race_range[0], race_range[1] + 1):
+                count += 1
+                status.write(f"解析中：{JCD_MAP.get(jcd, jcd)} {rno}R")
+                progress.progress(min(1.0, count / max(total, 1)))
 
-        if detected:
-            st.success(f"開催場を自動検出：{len(detected)}場")
-            st.write(" / ".join([JCD_MAP[j] for j in detected]))
-        else:
-            st.warning("開催場の自動検出に失敗しました。手動で選んでください。")
+                try:
+                    result = analyze_single_race(jcd, rno, hd, use_before, use_odds, pick_count)
+                    results.append(result)
+                except Exception:
+                    continue
 
-        all_options = [f"{jcd} {name}" for jcd, name in JCD_MAP.items()]
-        selected_labels = st.multiselect(
-            "チェックする開催場",
-            all_options,
-            default=default_labels if default_labels else [],
-        )
+        progress.empty()
+        status.empty()
 
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            min_conf = st.slider("表示する最低勝負度", 0, 100, 60)
-        with col_b:
-            max_rows = st.slider("最大表示レース数", 5, 50, 20)
-        with col_c:
-            race_range = st.slider("巡回R", 1, 12, (1, 12))
+        if not results:
+            st.error("解析できるレースがありませんでした。")
+            return
 
-        if st.button("全レースAIを実行", type="primary"):
-            selected_jcds = [x.split()[0] for x in selected_labels]
+        df_all = pd.DataFrame(results).sort_values(["場", "R"])
+        df_best = df_all[df_all["勝負度"] >= min_conf].sort_values(["勝負度", "本命指数"], ascending=False).head(max_rows)
 
-            if not selected_jcds:
-                st.warning("開催場を選んでください。")
-                return
+        tab1, tab2, tab3 = st.tabs(["全レース一覧", "本日の厳選レース", "開催場別の厳選"])
 
-            results = []
-            total = len(selected_jcds) * (race_range[1] - race_range[0] + 1)
-            progress = st.progress(0)
-            status = st.empty()
+        with tab1:
+            st.markdown("### 全レース一覧")
+            st.dataframe(df_all, width="stretch", hide_index=True)
 
-            count = 0
-            for jcd in selected_jcds:
-                for rno in range(race_range[0], race_range[1] + 1):
-                    count += 1
-                    status.write(f"解析中：{JCD_MAP.get(jcd, jcd)} {rno}R")
-                    progress.progress(min(1.0, count / max(total, 1)))
-
-                    try:
-                        result = analyze_single_race(jcd, rno, hd, use_before, use_odds)
-                        results.append(result)
-                    except Exception:
-                        continue
-
-            progress.empty()
-            status.empty()
-
-            if not results:
-                st.error("解析できるレースがありませんでした。")
-                return
-
-            df = pd.DataFrame(results)
-            df = df[df["勝負度"] >= min_conf]
-            df = df.sort_values(["勝負度", "本命指数"], ascending=False).head(max_rows)
-
-            st.markdown("### 今日の厳選レース")
-            if len(df) == 0:
+        with tab2:
+            st.markdown("### 本日の厳選レース")
+            if len(df_best) == 0:
                 st.info("条件に合うレースはありませんでした。最低勝負度を下げてください。")
             else:
-                st.dataframe(df, width="stretch", hide_index=True)
+                st.dataframe(df_best, width="stretch", hide_index=True)
 
-                st.markdown("### Note貼り付け用：厳選一覧")
                 lines = []
                 lines.append(f"【本日の厳選レース】{hd}")
                 lines.append("")
-                for _, row in df.iterrows():
+                for _, row in df_best.iterrows():
                     lines.append(
                         f"{row['判定']}｜{row['レース']}｜勝負度 {row['勝負度']}%｜"
                         f"本命 {row['本命']}｜候補 {row['買い目候補']}"
@@ -880,14 +861,57 @@ def main():
                 lines.append("")
                 lines.append("※指数・展示・成績を中心に自動評価しています。")
                 lines.append("※指数表・印とは連動していない場合もございます。")
-                st.text_area("コピー用", value="\n".join(lines), height=280)
+                st.text_area("Note貼り付け用", value="\n".join(lines), height=280)
 
+        with tab3:
+            st.markdown("### 開催場別の厳選レース")
+
+            if len(df_all) == 0:
+                st.info("表示できるデータがありません。")
+            else:
+                place_choice = st.selectbox("開催場を選択", sorted(df_all["場"].unique().tolist()))
+                df_place = df_all[df_all["場"] == place_choice].sort_values(["勝負度", "R"], ascending=[False, True])
+                df_place_best = df_place[df_place["勝負度"] >= min_conf]
+
+                st.markdown(f"#### {place_choice} 全レース")
+                st.dataframe(df_place, width="stretch", hide_index=True)
+
+                st.markdown(f"#### {place_choice} 厳選レース")
+                if len(df_place_best) == 0:
+                    st.info("この開催場では条件に合う厳選レースがありません。")
+                else:
+                    st.dataframe(df_place_best, width="stretch", hide_index=True)
+
+
+def main():
+    st.set_page_config(page_title="BOATRACE AI", page_icon="🚤", layout="wide")
+
+    st.title("🚤 BOATRACE AI")
+    st.caption(APP_VERSION)
+
+    today = datetime.now(JST).strftime("%Y%m%d")
+
+    st.sidebar.header("共通設定")
+    hd = st.sidebar.text_input("日付 hd", value=today)
+    use_before = st.sidebar.checkbox("直前情報を取得", value=True)
+    use_odds = st.sidebar.checkbox("オッズ取得を試す", value=False)
+    pick_count = st.sidebar.slider("買い目表示点数", 3, 20, 10)
+    debug = st.sidebar.checkbox("デバッグ表示", value=False)
+
+    mode = st.radio(
+        "モード",
+        ["全レースAI・厳選レース", "単レース予想"],
+        horizontal=True,
+    )
+
+    if mode == "全レースAI・厳選レース":
+        run_all_races_screen(hd, use_before, use_odds, pick_count)
     else:
         default_url = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno=2&jcd=20&hd={hd}"
         url = st.text_input("BOATRACE公式 出走表URL", value=default_url)
 
         if st.button("AI予想を実行", type="primary"):
-            run_single_race_view(url, use_before, use_odds, debug)
+            run_single_race_view(url, use_before, use_odds, pick_count, debug)
 
 
 if __name__ == "__main__":
