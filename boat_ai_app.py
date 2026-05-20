@@ -1,9 +1,6 @@
 # boat_ai_app.py
-# Boat Race AI v7.3
-# 出走表ズレ対策版
-# 1〜6号艇を固定して、同名重複・数値ズレを抑制
-# 出走表 / 直前情報 / 3連単オッズ
-# 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI / 買い目点数 1〜20点
+# Boat Race AI v7.4
+# 全角艇番対応・出走表ズレ修正版
 
 import re
 import math
@@ -16,14 +13,9 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-st.set_page_config(
-    page_title="Boat AI v7.3",
-    page_icon="🚤",
-    layout="wide"
-)
+st.set_page_config(page_title="Boat AI v7.4", page_icon="🚤", layout="wide")
 
 BASE_URL = "https://www.boatrace.jp/owpc/pc/race"
-
 JST = timezone(timedelta(hours=9))
 
 
@@ -40,20 +32,20 @@ JCD_MAP = {
     "芦屋": "21", "福岡": "22", "唐津": "23", "大村": "24",
 }
 
+ZEN_TO_HAN = str.maketrans("１２３４５６７８９０", "1234567890")
 
-# =====================================================
-# BASIC
-# =====================================================
 
 def clean_text(x):
-    if x is None:
-        return ""
-    return re.sub(r"\s+", " ", str(x)).strip()
+    return re.sub(r"\s+", " ", str(x or "")).strip()
+
+
+def normalize_num_text(x):
+    return clean_text(x).translate(ZEN_TO_HAN)
 
 
 def to_float(x, default=0.0):
     try:
-        s = str(x).replace("%", "").replace(",", "").strip()
+        s = normalize_num_text(x).replace("%", "").replace(",", "")
         if s in ["", "-", "—", "None", "nan", "欠場"]:
             return default
         return float(s)
@@ -72,9 +64,9 @@ def safe_get(url):
         r = requests.get(url, headers=headers, timeout=15)
         if r.status_code == 200 and r.text:
             return r.text
-        return None
     except Exception:
-        return None
+        pass
+    return None
 
 
 def build_url(page, rno, jcd, hd):
@@ -87,8 +79,7 @@ def fetch_pages(jcd, rno, hd):
         "直前情報": build_url("beforeinfo", rno, jcd, hd),
         "3連単オッズ": build_url("odds3t", rno, jcd, hd),
     }
-    htmls = {name: safe_get(url) for name, url in urls.items()}
-    return urls, htmls
+    return urls, {k: safe_get(v) for k, v in urls.items()}
 
 
 def default_boat_row(waku, status="出走表取得弱い"):
@@ -105,234 +96,102 @@ def default_boat_row(waku, status="出走表取得弱い"):
     }
 
 
-# =====================================================
-# 出走表 v7.3
-# =====================================================
+def parse_racelist(html):
+    if not html:
+        return pd.DataFrame([default_boat_row(i) for i in range(1, 7)])
 
-def extract_grade(text):
-    m = re.search(r"\b(A1|A2|B1|B2)\b", text)
-    return m.group(1) if m else "B1"
-
-
-def extract_name(text, waku):
-    text = clean_text(text)
-
-    bad_words = [
-        "全国", "当地", "モーター", "ボート", "勝率", "展示",
-        "平均", "進入", "能力", "事故", "早見", "今節", "前節",
-        "成績", "体重", "チルト", "部品", "交換"
-    ]
-
-    # 登録番号 + 級別 + 名前
-    patterns = [
-        r"\b\d{4}\b\s*(?:A1|A2|B1|B2)\s*([一-龥ぁ-んァ-ンー・]{2,}\s*[一-龥ぁ-んァ-ンー・]{1,})",
-        r"(?:A1|A2|B1|B2)\s*([一-龥ぁ-んァ-ンー・]{2,}\s*[一-龥ぁ-んァ-ンー・]{1,})",
-        r"\b\d{4}\b\s*([一-龥ぁ-んァ-ンー・]{2,}\s*[一-龥ぁ-んァ-ンー・]{1,})",
-    ]
-
-    for p in patterns:
-        m = re.search(p, text)
-        if not m:
-            continue
-
-        name = clean_text(m.group(1))
-        name = re.sub(r"(全国|当地|モーター|ボート|勝率|平均|ST).*", "", name).strip()
-
-        if 2 <= len(name.replace(" ", "")) <= 8 and not any(b in name for b in bad_words):
-            return name
-
-    return f"{waku}号艇"
-
-
-def extract_numbers_for_player(text):
-    nums = [to_float(x) for x in re.findall(r"\d+\.\d+", text)]
-
-    avg_st = 0.18
-    st_candidates = [n for n in nums if 0.05 <= n <= 0.35]
-    if st_candidates:
-        avg_st = st_candidates[0]
-
-    vals = [n for n in nums if 0 <= n <= 100 and not (0.05 <= n <= 0.35)]
-
-    national2 = 0.0
-    local2 = 0.0
-    motor2 = 0.0
-    boat2 = 0.0
-
-    # BOATRACE出走表の代表的な並び：
-    # 全国 勝率/2連率/3連率
-    # 当地 勝率/2連率/3連率
-    # モーター 2連率/3連率
-    # ボート 2連率/3連率
-    if len(vals) >= 3:
-        national2 = vals[1]
-    if len(vals) >= 6:
-        local2 = vals[4]
-    if len(vals) >= 8:
-        motor2 = vals[7]
-    if len(vals) >= 10:
-        boat2 = vals[9]
-
-    if 0 < national2 < 10 and len(vals) >= 3:
-        national2 = vals[2]
-    if 0 < local2 < 10 and len(vals) >= 6:
-        local2 = vals[5]
-
-    return round(national2, 2), round(local2, 2), round(motor2, 2), round(boat2, 2), avg_st
-
-
-def split_by_boat_number_from_text(soup):
-    full = soup.get_text("\n")
-    lines = [clean_text(x) for x in full.split("\n") if clean_text(x)]
+    soup = BeautifulSoup(html, "html.parser")
+    lines = [clean_text(x) for x in soup.get_text("\n").split("\n") if clean_text(x)]
 
     blocks = {i: [] for i in range(1, 7)}
     current = None
 
     for line in lines:
-        if re.fullmatch(r"[1-6]", line):
-            current = int(line)
+        nline = normalize_num_text(line)
+
+        if re.fullmatch(r"[1-6]", nline):
+            current = int(nline)
             blocks[current].append(line)
             continue
 
         if current in blocks:
             blocks[current].append(line)
 
-    out = {}
-    for waku in range(1, 7):
-        txt = clean_text(" ".join(blocks[waku]))
-        out[waku] = txt
-
-    return out
-
-
-def table_row_candidates(html):
-    candidates = {i: [] for i in range(1, 7)}
-
-    try:
-        tables = pd.read_html(html)
-    except Exception:
-        return candidates
-
-    for t in tables:
-        for _, row in t.iterrows():
-            cells = [clean_text(x) for x in row.tolist()]
-            row_text = clean_text(" ".join(cells))
-
-            if not re.search(r"\b(A1|A2|B1|B2)\b", row_text):
-                continue
-
-            for waku in range(1, 7):
-                if re.search(rf"(^|\s){waku}(\s|$)", row_text):
-                    candidates[waku].append(row_text)
-
-    return candidates
-
-
-def score_candidate_for_waku(text, waku):
-    if not text:
-        return -999
-
-    score = 0
-
-    if text.startswith(str(waku)):
-        score += 20
-
-    if re.search(rf"(^|\s){waku}(\s|$)", text):
-        score += 8
-
-    if re.search(r"\b\d{4}\b", text):
-        score += 8
-
-    if re.search(r"\b(A1|A2|B1|B2)\b", text):
-        score += 8
-
-    score += min(len(re.findall(r"\d+\.\d+", text)), 14)
-
-    # 他艇番始まりは強く減点
-    for other in range(1, 7):
-        if other != waku and text.startswith(str(other)):
-            score -= 30
-
-    return score
-
-
-def parse_racelist(html):
-    if not html:
-        return pd.DataFrame([default_boat_row(i) for i in range(1, 7)])
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    text_blocks = split_by_boat_number_from_text(soup)
-    table_candidates = table_row_candidates(html)
-
     rows = []
 
-    used_names = set()
-
     for waku in range(1, 7):
-        candidates = []
-
-        if text_blocks.get(waku):
-            candidates.append(text_blocks[waku])
-
-        candidates.extend(table_candidates.get(waku, []))
-
-        # class近辺も候補にするが、広すぎる親は避ける
-        boat_img = soup.find(class_=re.compile(f"table1_boatImage{waku}"))
-        if boat_img:
-            parent = boat_img.find_parent(["tr", "div"])
-            if parent:
-                parent_text = clean_text(parent.get_text(" "))
-                if parent_text:
-                    candidates.append(parent_text)
-
-        best = ""
-        best_score = -999
-
-        for c in candidates:
-            s = score_candidate_for_waku(c, waku)
-            if s > best_score:
-                best = c
-                best_score = s
-
-        if not best:
+        block = blocks.get(waku, [])
+        if not block:
             rows.append(default_boat_row(waku))
             continue
 
-        name = extract_name(best, waku)
-        grade = extract_grade(best)
-        national2, local2, motor2, boat2, avg_st = extract_numbers_for_player(best)
+        joined = clean_text(" ".join(block))
+        joined_norm = normalize_num_text(joined)
 
-        status = "OK固定"
+        grade = "B1"
+        reg_index = None
 
-        # 同じ選手名が複数艇で出た場合は、その艇だけ仮名に戻してズレ防止
-        if name in used_names and name != f"{waku}号艇":
-            name = f"{waku}号艇"
-            status = "名前重複防止"
+        for i, line in enumerate(block):
+            nline = normalize_num_text(line)
+            m = re.search(r"\b\d{4}\s*/\s*(A1|A2|B1|B2)\b", nline)
+            if m:
+                grade = m.group(1)
+                reg_index = i
+                break
 
-        if name == f"{waku}号艇":
-            status = "名前取得弱い"
+        name = f"{waku}号艇"
+        if reg_index is not None:
+            for j in range(reg_index + 1, min(reg_index + 5, len(block))):
+                candidate = clean_text(block[j])
+                if re.search(r"[一-龥ぁ-んァ-ンー]", candidate):
+                    if not any(x in candidate for x in ["F", "L", "歳", "kg", "全国", "当地"]):
+                        name = candidate
+                        break
 
-        used_names.add(name)
+        avg_st = 0.18
+        national2 = 0.0
+        local2 = 0.0
+        motor2 = 0.0
+        boat2 = 0.0
+
+        avg_idx = None
+        for i, line in enumerate(block):
+            nline = normalize_num_text(line)
+            if re.search(r"\b0\.\d{2}\b\s+\d+\.\d+", nline):
+                avg_idx = i
+                nums = re.findall(r"\d+\.\d+", nline)
+                if nums:
+                    avg_st = to_float(nums[0], 0.18)
+                break
+
+        if avg_idx is not None:
+            def line_float(offset):
+                idx = avg_idx + offset
+                if 0 <= idx < len(block):
+                    vals = re.findall(r"\d+\.\d+", normalize_num_text(block[idx]))
+                    if vals:
+                        return to_float(vals[0])
+                return 0.0
+
+            national2 = line_float(1)
+            local2 = line_float(3)
+            motor2 = line_float(5)
+            boat2 = line_float(7)
 
         rows.append({
             "艇": waku,
             "選手": name,
             "級別": grade,
-            "全国2連率": national2,
-            "当地2連率": local2,
-            "モーター": motor2,
-            "ボート": boat2,
-            "平均ST": avg_st,
-            "データ状態": status,
+            "全国2連率": round(national2, 2),
+            "当地2連率": round(local2, 2),
+            "モーター": round(motor2, 2),
+            "ボート": round(boat2, 2),
+            "平均ST": round(avg_st, 2),
+            "データ状態": "OK全角対応" if name != f"{waku}号艇" else "名前取得弱い",
         })
 
     return pd.DataFrame(rows)
 
-
-# =====================================================
-# 直前情報
-# =====================================================
 
 def parse_beforeinfo(html):
     base = pd.DataFrame([
@@ -344,7 +203,7 @@ def parse_beforeinfo(html):
         return base
 
     soup = BeautifulSoup(html, "html.parser")
-    text = clean_text(soup.get_text(" "))
+    text = normalize_num_text(soup.get_text(" "))
 
     times = [to_float(x) for x in re.findall(r"\b6\.\d{2}\b", text)]
     times = [x for x in times if 6.40 <= x <= 7.20]
@@ -352,10 +211,7 @@ def parse_beforeinfo(html):
     st_vals = []
     for s in re.findall(r"(?<!\d)(?:F|L)?\.?\d{2}(?!\d)", text):
         s = s.replace("F", "").replace("L", "")
-        if s.startswith("."):
-            v = to_float("0" + s)
-        else:
-            v = to_float("0." + s)
+        v = to_float("0" + s if s.startswith(".") else "0." + s)
         if 0.00 <= v <= 0.40:
             st_vals.append(v)
 
@@ -369,10 +225,6 @@ def parse_beforeinfo(html):
     return base
 
 
-# =====================================================
-# 3連単オッズ
-# =====================================================
-
 def all_3t_combos():
     return [f"{a}-{b}-{c}" for a, b, c in itertools.permutations([1, 2, 3, 4, 5, 6], 3)]
 
@@ -382,32 +234,8 @@ def parse_odds3t(html):
         return pd.DataFrame()
 
     rows = []
-    rows.extend(parse_odds_explicit_combo(html))
-    rows.extend(parse_odds_table_restore(html))
-    rows.extend(parse_odds_raw_restore(html))
-
-    df = pd.DataFrame(rows)
-
-    if df.empty:
-        return df
-
-    df["オッズ"] = pd.to_numeric(df["オッズ"], errors="coerce")
-    df = df.dropna(subset=["オッズ"])
-    df = df[(df["オッズ"] > 0) & (df["オッズ"] < 9999)]
-
-    df = df.sort_values(["買い目", "取得優先"], ascending=[True, True])
-    df = df.drop_duplicates("買い目", keep="first")
-
-    df = df.sort_values("オッズ", ascending=True).reset_index(drop=True)
-    df["人気順"] = range(1, len(df) + 1)
-
-    return df
-
-
-def parse_odds_explicit_combo(html):
-    rows = []
     soup = BeautifulSoup(html, "html.parser")
-    text = clean_text(soup.get_text(" "))
+    text = normalize_num_text(soup.get_text(" "))
 
     patterns = [
         r"([1-6])\s*[-–]\s*([1-6])\s*[-–]\s*([1-6])\s+(\d+\.\d+)",
@@ -419,108 +247,41 @@ def parse_odds_explicit_combo(html):
             if len(m) == 4:
                 a, b, c, odd = m
                 if len({a, b, c}) == 3:
-                    rows.append({
-                        "買い目": f"{a}-{b}-{c}",
-                        "オッズ": to_float(odd),
-                        "取得方式": "explicit_text",
-                        "取得優先": 1,
-                    })
+                    rows.append({"買い目": f"{a}-{b}-{c}", "オッズ": to_float(odd), "取得方式": "text"})
             elif len(m) == 2:
                 combo, odd = m
                 if len(set(combo)) == 3:
-                    rows.append({
-                        "買い目": f"{combo[0]}-{combo[1]}-{combo[2]}",
-                        "オッズ": to_float(odd),
-                        "取得方式": "explicit_text_123",
-                        "取得優先": 2,
-                    })
-
-    return rows
-
-
-def parse_odds_table_restore(html):
-    rows = []
+                    rows.append({"買い目": f"{combo[0]}-{combo[1]}-{combo[2]}", "オッズ": to_float(odd), "取得方式": "text123"})
 
     try:
         tables = pd.read_html(html)
+        for ti, t in enumerate(tables):
+            flat = [normalize_num_text(x) for x in t.values.flatten()]
+            odds_values = []
+            for s in flat:
+                for x in re.findall(r"\d+\.\d+", s):
+                    v = to_float(x)
+                    if 1.0 <= v <= 9999:
+                        odds_values.append(v)
+
+            if len(odds_values) >= 80:
+                combos = all_3t_combos()
+                for i in range(min(len(odds_values), len(combos))):
+                    rows.append({"買い目": combos[i], "オッズ": odds_values[i], "取得方式": f"table_restore_{ti}"})
     except Exception:
-        return rows
+        pass
 
-    for table_index, t in enumerate(tables):
-        flat = []
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
 
-        for v in t.values.flatten():
-            s = clean_text(v)
-            if not s or s in ["nan", "None", "-", "—"]:
-                continue
-            flat.append(s)
-
-        odds_values = []
-        for s in flat:
-            for x in re.findall(r"\d+\.\d+", s):
-                v = to_float(x)
-                if 1.0 <= v <= 9999:
-                    odds_values.append(v)
-
-        if len(odds_values) >= 80:
-            combos = all_3t_combos()
-            limit = min(len(odds_values), len(combos))
-
-            for i in range(limit):
-                rows.append({
-                    "買い目": combos[i],
-                    "オッズ": odds_values[i],
-                    "取得方式": f"table_restore_{table_index}",
-                    "取得優先": 3,
-                })
-
-        tokens = []
-        for s in flat:
-            tokens.extend(re.findall(r"[1-6]|\d+\.\d+", s))
-
-        for i in range(len(tokens) - 3):
-            a, b, c, odd = tokens[i], tokens[i + 1], tokens[i + 2], tokens[i + 3]
-            if (
-                a in list("123456")
-                and b in list("123456")
-                and c in list("123456")
-                and len({a, b, c}) == 3
-                and re.match(r"^\d+\.\d+$", odd)
-            ):
-                rows.append({
-                    "買い目": f"{a}-{b}-{c}",
-                    "オッズ": to_float(odd),
-                    "取得方式": "table_tokens",
-                    "取得優先": 2,
-                })
-
-    return rows
-
-
-def parse_odds_raw_restore(html):
-    rows = []
-    raw = clean_text(html)
-
-    odds_values = []
-
-    for x in re.findall(r">\s*(\d+\.\d+)\s*<", raw):
-        v = to_float(x)
-        if 1.0 <= v <= 9999:
-            odds_values.append(v)
-
-    if len(odds_values) >= 80:
-        combos = all_3t_combos()
-        limit = min(len(odds_values), len(combos))
-
-        for i in range(limit):
-            rows.append({
-                "買い目": combos[i],
-                "オッズ": odds_values[i],
-                "取得方式": "raw_tag_restore",
-                "取得優先": 4,
-            })
-
-    return rows
+    df["オッズ"] = pd.to_numeric(df["オッズ"], errors="coerce")
+    df = df.dropna(subset=["オッズ"])
+    df = df[(df["オッズ"] > 0) & (df["オッズ"] < 9999)]
+    df = df.drop_duplicates("買い目")
+    df = df.sort_values("オッズ", ascending=True).reset_index(drop=True)
+    df["人気順"] = range(1, len(df) + 1)
+    return df
 
 
 def make_fallback_odds(power):
@@ -529,7 +290,6 @@ def make_fallback_odds(power):
 
     for combo in itertools.permutations([1, 2, 3, 4, 5, 6], 3):
         a, b, c = combo
-
         odd = (
             4.5
             + rank_map.get(a, 6) * 2.5
@@ -538,20 +298,10 @@ def make_fallback_odds(power):
             + max(0, a - 1) * 2.0
             + max(0, c - 3) * 2.5
         )
-
-        rows.append({
-            "買い目": f"{a}-{b}-{c}",
-            "オッズ": round(odd, 1),
-            "人気順": 0,
-            "取得方式": "AI仮オッズ"
-        })
+        rows.append({"買い目": f"{a}-{b}-{c}", "オッズ": round(odd, 1), "人気順": 0, "取得方式": "AI仮オッズ"})
 
     return pd.DataFrame(rows)
 
-
-# =====================================================
-# AI LOGIC
-# =====================================================
 
 def grade_score(g):
     return {"A1": 18, "A2": 12, "B1": 5, "B2": 1}.get(str(g), 5)
@@ -564,7 +314,6 @@ def neutral_if_zero(value, neutral):
 
 def calc_power(race, before):
     df = race.merge(before, on="艇", how="left")
-
     scores = []
 
     for _, r in df.iterrows():
@@ -605,7 +354,6 @@ def calc_power(race, before):
     df["AI指数"] = scores
     df = df.sort_values("AI指数", ascending=False).reset_index(drop=True)
     df["順位"] = range(1, len(df) + 1)
-
     return df
 
 
@@ -614,11 +362,7 @@ def combo_score(combo, power):
     rank_map = dict(zip(power["艇"], power["順位"]))
 
     a, b, c = combo
-    s = 0.0
-
-    s += score_map.get(a, 0) * 0.52
-    s += score_map.get(b, 0) * 0.30
-    s += score_map.get(c, 0) * 0.18
+    s = score_map.get(a, 0) * 0.52 + score_map.get(b, 0) * 0.30 + score_map.get(c, 0) * 0.18
 
     if a == 1:
         s += 10
@@ -632,7 +376,6 @@ def combo_score(combo, power):
         s += 3
 
     s += max(0, 7 - rank_map.get(a, 6)) * 2
-
     return round(max(s, 1), 1)
 
 
@@ -645,13 +388,11 @@ def build_tickets(power, odds):
     for combo in itertools.permutations([1, 2, 3, 4, 5, 6], 3):
         key = f"{combo[0]}-{combo[1]}-{combo[2]}"
         odd = odd_map.get(key)
-
         if odd is None or odd <= 0:
             continue
 
         ai = combo_score(combo, power)
         popularity = pop_map.get(key, 0)
-
         ev = ai * math.log(odd + 1)
 
         if popularity and popularity <= 5 and odd < 8 and ai < 92:
@@ -678,7 +419,6 @@ def build_tickets(power, odds):
         })
 
     df = pd.DataFrame(rows)
-
     if df.empty:
         return df
 
@@ -694,13 +434,12 @@ def selected_tickets(df, ticket_count=10):
     hole_count = max(0, round(ticket_count * 0.30))
     saver_count = max(0, ticket_count - hot_count - main_count - hole_count)
 
-    hot = df[df["分類"] == "熱🔥"].head(hot_count)
-    main = df[df["分類"] == "本線"].head(main_count)
-    hole = df[df["分類"] == "穴"].head(hole_count)
-    saver = df[df["分類"] == "抑え"].head(saver_count)
-
-    out = pd.concat([hot, main, hole, saver])
-    out = out.drop_duplicates("買い目")
+    out = pd.concat([
+        df[df["分類"] == "熱🔥"].head(hot_count),
+        df[df["分類"] == "本線"].head(main_count),
+        df[df["分類"] == "穴"].head(hole_count),
+        df[df["分類"] == "抑え"].head(saver_count),
+    ]).drop_duplicates("買い目")
 
     if len(out) < ticket_count:
         add = df[~df["買い目"].isin(out["買い目"])].head(ticket_count - len(out))
@@ -714,12 +453,7 @@ def heavy_ai(df):
         return df
 
     out = df.copy()
-
-    out["厚張り指数"] = (
-        out["AI信頼度"] * 0.70
-        + out["期待値"] * 0.22
-        - out["オッズ"] * 0.08
-    )
+    out["厚張り指数"] = out["AI信頼度"] * 0.70 + out["期待値"] * 0.22 - out["オッズ"] * 0.08
 
     out = out[
         (out["AI信頼度"] >= 82)
@@ -730,16 +464,11 @@ def heavy_ai(df):
     return out.sort_values("厚張り指数", ascending=False).head(3).reset_index(drop=True)
 
 
-# =====================================================
-# UI
-# =====================================================
-
-st.title("🚤 Boat Race AI v7.3")
-st.caption("出走表ズレ対策版 / 日本時間Today / 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI")
+st.title("🚤 Boat Race AI v7.4")
+st.caption("全角艇番対応・出走表ズレ修正版 / 熱🔥 / 本線 / 穴 / 抑え / 厳選 / 厚張りAI")
 
 with st.sidebar:
     st.header("設定")
-
     st.caption(f"日本時間の今日：{today_jst().strftime('%Y/%m/%d')}")
 
     place = st.selectbox("場", list(JCD_MAP.keys()))
@@ -749,18 +478,10 @@ with st.sidebar:
     hd = race_date.strftime("%Y%m%d")
 
     race_no = st.number_input("レース", min_value=1, max_value=12, value=1)
-
     ticket_count = st.slider("買い目点数", 1, 20, 10, 1)
 
-    allow_fallback_odds = st.checkbox(
-        "オッズ取得失敗時はAI仮オッズで表示",
-        value=True
-    )
-
-    show_debug = st.checkbox(
-        "取得デバッグ表示",
-        value=False
-    )
+    allow_fallback_odds = st.checkbox("オッズ取得失敗時はAI仮オッズで表示", value=True)
+    show_debug = st.checkbox("取得デバッグ表示", value=False)
 
     run = st.button("AI予想開始", width="stretch")
 
@@ -785,7 +506,6 @@ if run:
     power = calc_power(race, before)
 
     odds = parse_odds3t(htmls.get("3連単オッズ"))
-
     odds_count = len(odds)
     odds_status = f"実オッズ取得OK：{odds_count}件"
 
@@ -817,8 +537,7 @@ if run:
     show_cols = [
         "順位", "艇", "選手", "級別", "AI指数",
         "展示", "展示ST", "平均ST",
-        "全国2連率", "当地2連率",
-        "モーター", "ボート", "データ状態"
+        "全国2連率", "当地2連率", "モーター", "ボート", "データ状態"
     ]
 
     st.dataframe(power[show_cols], width="stretch", hide_index=True)
@@ -827,37 +546,28 @@ if run:
         st.warning("買い目を生成できませんでした。データ不足または基準未満です。")
         st.stop()
 
-    hot = tickets[tickets["分類"] == "熱🔥"].head(3)
-    main = tickets[tickets["分類"] == "本線"].head(5)
-    hole = tickets[tickets["分類"] == "穴"].head(5)
-    saver = tickets[tickets["分類"] == "抑え"].head(5)
-
-    if not hot.empty:
-        st.markdown("## 熱🔥")
-        st.dataframe(hot, width="stretch", hide_index=True)
-
-    st.markdown("## 本線")
-    st.dataframe(main, width="stretch", hide_index=True)
-
-    st.markdown("## 穴")
-    st.dataframe(hole, width="stretch", hide_index=True)
-
-    st.markdown("## 抑え")
-    st.dataframe(saver, width="stretch", hide_index=True)
+    for title, label, n in [
+        ("## 熱🔥", "熱🔥", 3),
+        ("## 本線", "本線", 5),
+        ("## 穴", "穴", 5),
+        ("## 抑え", "抑え", 5),
+    ]:
+        part = tickets[tickets["分類"] == label].head(n)
+        if not part.empty:
+            st.markdown(title)
+            st.dataframe(part, width="stretch", hide_index=True)
 
     st.markdown("## 厳選買い目")
     st.success(f"{ticket_count}点に厳選")
     st.dataframe(selected, width="stretch", hide_index=True)
 
     st.markdown("## 厚張り厳選AI")
-
     if heavy.empty:
         st.warning("厚張り候補なし。無理に厚張りしない判定です。")
     else:
         st.dataframe(heavy, width="stretch", hide_index=True)
 
     top = power.iloc[0]
-
     st.info(
         f"""
 中心評価：{int(top["艇"])}号艇  
