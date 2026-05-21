@@ -1,6 +1,6 @@
 # boat_ai_app.py
-# BOATRACE AI v10.2
-# 勝負度100乱発抑制・表示列整理・熱判定厳格化版
+# BOATRACE AI v10.3
+# 買い目バランスAI・1頭偏り抑制・的中率重視版
 # GitHub + Streamlit Cloud 用
 
 import re
@@ -16,7 +16,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-APP_VERSION = "v10.2 勝負度調整・表示整理版"
+APP_VERSION = "v10.3 買い目バランスAI版"
 
 JST = timezone(timedelta(hours=9))
 
@@ -586,7 +586,10 @@ def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic
         s += 7.0
 
     if tactic["展開"] == "イン逃げ濃厚":
-        s += 14 if a == 1 else -12
+        if a == 1:
+            s += 8
+        else:
+            s -= 4
         if b in [2, 3, 4]:
             s += 3
         if c in [2, 3, 4, 5]:
@@ -594,15 +597,15 @@ def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic
 
     elif tactic["展開"] == "1飛び警戒":
         if a == 1:
-            s -= 9
+            s -= 10
         if a in [2, 3, 4]:
-            s += 8
+            s += 9
         if 1 in [b, c]:
             s += 4
 
     elif tactic["展開"] == "穴期待":
         if a in [3, 4]:
-            s += 7
+            s += 8
         if b in [1, 4, 5]:
             s += 3
 
@@ -618,7 +621,7 @@ def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic
             s += 1.5
 
     if a == 6 and r1.score < 95:
-        s -= 10.0
+        s -= 12.0
 
     if odd > 0:
         if 7.0 <= odd <= 35.0:
@@ -631,6 +634,109 @@ def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic
             s -= 8.0
 
     return round(s, 2)
+
+
+def balance_predictions(df: pd.DataFrame, tactic: Dict, pick_count: int, preset: str) -> pd.DataFrame:
+    df = df.copy()
+    df["頭"] = df["買い目"].astype(str).str.split("-").str[0].astype(int)
+
+    if preset == "的中率重視":
+        total = min(pick_count, 6)
+        max_head1 = 3
+    elif preset == "標準":
+        total = pick_count
+        max_head1 = 4
+    else:
+        total = max(pick_count, 12)
+        max_head1 = 5
+
+    style = tactic["展開"]
+
+    if style == "イン逃げ濃厚":
+        head_priority = [1, 2, 3, 4]
+        quota = {1: max_head1, 2: 1, 3: 1, 4: 1}
+    elif style == "1飛び警戒":
+        head_priority = [2, 3, 4, 1, 5]
+        quota = {1: 2, 2: 2, 3: 2, 4: 2, 5: 1}
+    elif style == "穴期待":
+        head_priority = [1, 3, 4, 2, 5]
+        quota = {1: 2, 2: 1, 3: 2, 4: 2, 5: 1}
+    else:
+        head_priority = [1, 2, 3, 4, 5]
+        quota = {1: 2, 2: 2, 3: 2, 4: 1, 5: 1}
+
+    selected = []
+    selected_keys = set()
+    head_counts = {i: 0 for i in range(1, 7)}
+
+    # まず展開に応じた頭を分散して拾う
+    for head in head_priority:
+        limit = quota.get(head, 1)
+        cand = df[df["頭"] == head].sort_values("評価", ascending=False)
+
+        for _, row in cand.iterrows():
+            key = row["買い目"]
+            if key in selected_keys:
+                continue
+            if head == 1 and head_counts[1] >= max_head1:
+                continue
+            if head_counts[head] >= limit:
+                continue
+
+            selected.append(row)
+            selected_keys.add(key)
+            head_counts[head] += 1
+
+            if len(selected) >= total:
+                break
+
+        if len(selected) >= total:
+            break
+
+    # 足りない分は高評価順。ただし1頭に偏りすぎない
+    for _, row in df.sort_values("評価", ascending=False).iterrows():
+        if len(selected) >= total:
+            break
+
+        key = row["買い目"]
+        head = int(row["頭"])
+
+        if key in selected_keys:
+            continue
+        if head == 1 and head_counts[1] >= max_head1:
+            continue
+
+        selected.append(row)
+        selected_keys.add(key)
+        head_counts[head] += 1
+
+    # それでも足りない場合は純粋高評価で補完
+    for _, row in df.sort_values("評価", ascending=False).iterrows():
+        if len(selected) >= total:
+            break
+
+        key = row["買い目"]
+        if key in selected_keys:
+            continue
+
+        selected.append(row)
+        selected_keys.add(key)
+
+    out = pd.DataFrame(selected).drop(columns=["頭"], errors="ignore").reset_index(drop=True)
+
+    labels = []
+    for i, row in out.iterrows():
+        if i < 2:
+            labels.append("熱🔥")
+        elif i < 5:
+            labels.append("本線")
+        elif i < total - 1:
+            labels.append("抑え")
+        else:
+            labels.append("穴")
+    out["区分"] = labels
+
+    return out
 
 
 def generate_predictions(racers: List[Racer], odds: Dict[str, float], pick_count: int = 10, preset: str = "標準") -> pd.DataFrame:
@@ -647,22 +753,8 @@ def generate_predictions(racers: List[Racer], odds: Dict[str, float], pick_count
             "オッズ": odd if odd > 0 else "未取得",
         })
 
-    df = pd.DataFrame(rows).sort_values("評価", ascending=False).reset_index(drop=True)
-
-    labels = []
-    for i, row in df.iterrows():
-        odd = row["オッズ"]
-        odd_num = odd if isinstance(odd, float) else 0
-        if i < 2:
-            labels.append("熱🔥")
-        elif i < 5:
-            labels.append("本線")
-        elif odd_num >= 35 or i < 9:
-            labels.append("穴")
-        else:
-            labels.append("抑え")
-
-    df["区分"] = labels
+    raw_df = pd.DataFrame(rows).sort_values("評価", ascending=False).reset_index(drop=True)
+    df = balance_predictions(raw_df, tactic, pick_count, preset)
 
     conf = race_confidence(racers)["confidence"]
     df["勝負度"] = conf
@@ -673,11 +765,7 @@ def generate_predictions(racers: List[Racer], odds: Dict[str, float], pick_count
     if conf >= 90:
         df.loc[df.index[:1], "厚張りAI"] = "強"
 
-    if preset == "的中率重視":
-        return df.head(min(pick_count, 6))
-    if preset == "攻め":
-        return df.head(max(pick_count, 12))
-    return df.head(pick_count)
+    return df
 
 
 @st.cache_data(ttl=600, show_spinner=False)
