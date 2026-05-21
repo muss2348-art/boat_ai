@@ -1,6 +1,6 @@
 # boat_ai_app.py
-# BOATRACE AI v10.3
-# 買い目バランスAI・1頭偏り抑制・的中率重視版
+# BOATRACE AI v10.4
+# 頭期待値AI・全艇頭候補評価・外枠頭抜け対策版
 # GitHub + Streamlit Cloud 用
 
 import re
@@ -16,7 +16,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-APP_VERSION = "v10.3 買い目バランスAI版"
+APP_VERSION = "v10.4 頭期待値AI・全艇頭候補評価版"
 
 JST = timezone(timedelta(hours=9))
 
@@ -54,6 +54,7 @@ class Racer:
     tenji_st: float = 0.0
     tenji_f: bool = False
     score: float = 0.0
+    head_power: float = 0.0
     data_status: str = ""
 
 
@@ -390,8 +391,106 @@ def calculate_scores(racers: List[Racer]) -> List[Racer]:
     return sorted(racers, key=lambda x: x.score, reverse=True)
 
 
+def calculate_head_power(racers: List[Racer]) -> List[Racer]:
+    ranked = calculate_scores(racers)
+    by_lane = {r.lane: r for r in racers}
+
+    top_score = ranked[0].score if ranked else 0
+    avg_display = sum([r.display_time for r in racers if r.display_time > 0]) / max(1, len([r for r in racers if r.display_time > 0]))
+    avg_st = sum([r.avg_st for r in racers if r.avg_st > 0]) / max(1, len([r for r in racers if r.avg_st > 0]))
+
+    one = by_lane.get(1)
+    one_weak = False
+    if one:
+        one_weak = (
+            one.score < top_score - 8
+            or one.avg_st >= 0.19
+            or (one.display_time and avg_display and one.display_time > avg_display + 0.08)
+            or one.klass == "B1"
+        )
+
+    for r in racers:
+        hp = 40.0
+
+        # 総合指数と頭期待値は別評価。指数が高い艇は当然頭候補。
+        hp += max(0, r.score - 85) * 0.75
+
+        # 級別。A1/A2は外枠でも頭候補に残す。
+        if r.klass == "A1":
+            hp += 11
+        elif r.klass == "A2":
+            hp += 6
+        elif r.klass == "B2":
+            hp -= 5
+
+        # コース基本補正。ただし外枠を殺しすぎない。
+        hp += {1: 12, 2: 5, 3: 4, 4: 4, 5: 1, 6: -2}.get(r.lane, 0)
+
+        # ST・展示・機力・当地。
+        if r.avg_st and avg_st:
+            if r.avg_st <= avg_st - 0.03:
+                hp += 7
+            elif r.avg_st <= avg_st - 0.015:
+                hp += 4
+            elif r.avg_st >= avg_st + 0.03:
+                hp -= 5
+
+        if r.display_time and avg_display:
+            if r.display_time <= avg_display - 0.06:
+                hp += 9
+            elif r.display_time <= avg_display - 0.03:
+                hp += 5
+            elif r.display_time >= avg_display + 0.08:
+                hp -= 6
+
+        if r.tenji_st:
+            if r.tenji_st <= 0.06:
+                hp += 5
+            elif r.tenji_st <= 0.10:
+                hp += 3
+            elif r.tenji_st >= 0.18:
+                hp -= 3
+        if r.tenji_f:
+            hp -= 7
+
+        if r.motor_2 >= 40:
+            hp += 6
+        elif r.motor_2 >= 35:
+            hp += 3
+        elif r.motor_2 and r.motor_2 <= 25:
+            hp -= 4
+
+        if r.local_2 >= 45:
+            hp += 5
+        elif r.local_2 >= 35:
+            hp += 2
+        elif r.local_2 and r.local_2 <= 15:
+            hp -= 3
+
+        # 1号艇が弱い時は、2〜5の頭期待値を強く上げる。
+        if one_weak and r.lane in [2, 3, 4, 5]:
+            hp += 8
+
+        # 外枠A1・展示上位・当地強いなら頭抜け候補にする。
+        if r.lane in [4, 5, 6] and r.klass == "A1":
+            hp += 8
+        if r.lane in [4, 5, 6] and r.display_time and avg_display and r.display_time <= avg_display - 0.04:
+            hp += 5
+        if r.lane in [4, 5, 6] and r.local_2 >= 45:
+            hp += 5
+
+        # 6頭はかなり根拠が必要。
+        if r.lane == 6 and not (r.klass == "A1" and r.score >= top_score - 5):
+            hp -= 6
+
+        r.head_power = round(max(0, min(100, hp)), 1)
+
+    return sorted(racers, key=lambda x: x.head_power, reverse=True)
+
+
 def tactic_analysis(racers: List[Racer]) -> Dict:
     ranked = calculate_scores(racers)
+    head_ranked = calculate_head_power(racers)
     by_lane = {r.lane: r for r in racers}
 
     one = by_lane.get(1)
@@ -405,8 +504,8 @@ def tactic_analysis(racers: List[Racer]) -> Dict:
     comments = []
 
     if one:
-        in_score += max(0, one.score - 82) * 0.65
-        in_score += class_bonus(one.klass) * 0.6
+        in_score += max(0, one.head_power - 65) * 0.6
+        in_score += class_bonus(one.klass) * 0.5
 
         if one.avg_st <= 0.15:
             in_score += 7
@@ -430,11 +529,6 @@ def tactic_analysis(racers: List[Racer]) -> Dict:
             in_score -= 7
             upset_score += 6
 
-        if one.klass in ["A1", "A2"]:
-            in_score += 5
-        else:
-            upset_score += 5
-
     if four:
         if four.avg_st <= 0.14:
             upset_score += 6
@@ -444,29 +538,35 @@ def tactic_analysis(racers: List[Racer]) -> Dict:
             upset_score += 5
             hole_score += 4
             comments.append("4号艇展示良好")
-        if four.score >= ranked[0].score - 5:
+        if four.head_power >= head_ranked[0].head_power - 5:
             upset_score += 7
             hole_score += 5
-            comments.append("4号艇指数上位")
+            comments.append("4号艇頭期待値上位")
 
-    if two and two.score >= ranked[0].score - 6:
+    # 1以外の頭期待値が高ければ1飛び・穴期待へ寄せる
+    top_head = head_ranked[0]
+    if top_head.lane != 1:
+        upset_score += 10
+        comments.append(f"{top_head.lane}号艇の頭期待値上位")
+
+    if two and two.head_power >= head_ranked[0].head_power - 6:
         in_score += 2
         comments.append("2号艇相手有力")
 
-    if three and three.score >= ranked[0].score - 6:
+    if three and three.head_power >= head_ranked[0].head_power - 6:
         hole_score += 4
         comments.append("3号艇連絡み注意")
 
-    if ranked[0].lane == 1:
-        in_score += 6
+    if by_lane.get(1) and by_lane[1].head_power >= head_ranked[0].head_power - 4:
+        in_score += 4
     else:
-        upset_score += 8
+        upset_score += 6
 
     in_score = round(max(0, min(100, in_score)), 1)
     upset_score = round(max(0, min(100, upset_score)), 1)
     hole_score = round(max(0, min(100, hole_score)), 1)
 
-    if in_score >= 78:
+    if in_score >= 78 and by_lane.get(1) and by_lane[1].head_power >= head_ranked[0].head_power - 5:
         style = "イン逃げ濃厚"
     elif upset_score >= 68:
         style = "1飛び警戒"
@@ -480,19 +580,23 @@ def tactic_analysis(racers: List[Racer]) -> Dict:
         "イン逃げ度": in_score,
         "1飛び警戒": upset_score,
         "穴期待度": hole_score,
-        "コメント": " / ".join(comments[:4]) if comments else "大きな偏りなし",
+        "頭期待1位": f"{top_head.lane}号艇 {top_head.name}",
+        "コメント": " / ".join(comments[:5]) if comments else "大きな偏りなし",
     }
 
 
 def race_confidence(racers: List[Racer]) -> Dict:
     ranked = calculate_scores(racers)
+    head_ranked = calculate_head_power(racers)
     tactic = tactic_analysis(racers)
 
     top = ranked[0]
     second = ranked[1]
     sixth = ranked[5]
+    head_top = head_ranked[0]
 
     top_gap = top.score - second.score
+    head_gap = head_ranked[0].head_power - head_ranked[1].head_power
     top3_gap = ranked[2].score - ranked[3].score if len(ranked) >= 4 else 0
     spread = top.score - sixth.score
 
@@ -500,30 +604,33 @@ def race_confidence(racers: List[Racer]) -> Dict:
     display_ok_count = sum(1 for r in racers if r.display_time > 0)
 
     confidence = 38
-    confidence += max(0, top.score - 88) * 0.45
-    confidence += max(0, top_gap) * 1.35
-    confidence += max(0, top3_gap) * 0.45
+    confidence += max(0, top.score - 88) * 0.35
+    confidence += max(0, top_gap) * 1.0
+    confidence += max(0, head_gap) * 0.9
+    confidence += max(0, top3_gap) * 0.35
     confidence += data_ok_count * 0.8
     confidence += display_ok_count * 0.7
 
     if tactic["展開"] == "イン逃げ濃厚":
         confidence += 5
     elif tactic["展開"] == "1飛び警戒":
-        confidence -= 4
+        confidence -= 2
     elif tactic["展開"] == "混戦":
-        confidence -= 7
+        confidence -= 6
 
-    if top.lane == 1:
-        confidence += 3
-    if top.klass == "A1":
+    if head_top.lane == 1:
+        confidence += 2
+    if top.klass == "A1" or head_top.klass == "A1":
         confidence += 3
     if top.tenji_f:
         confidence -= 10
 
     if top_gap < 3:
-        confidence -= 10
-    if spread < 18:
         confidence -= 8
+    if head_gap < 4:
+        confidence -= 5
+    if spread < 18:
+        confidence -= 7
     if display_ok_count < 6:
         confidence -= 5
     if data_ok_count < 6:
@@ -531,9 +638,9 @@ def race_confidence(racers: List[Racer]) -> Dict:
 
     confidence = round(max(0, min(96, confidence)), 1)
 
-    if confidence >= 90 and top_gap >= 8 and spread >= 25 and data_ok_count >= 6 and display_ok_count >= 6:
+    if confidence >= 90 and head_gap >= 8 and spread >= 25 and data_ok_count >= 6 and display_ok_count >= 6:
         grade = "熱🔥"
-    elif confidence >= 80 and top_gap >= 5:
+    elif confidence >= 80 and head_gap >= 5:
         grade = "厚張り候補"
     elif confidence >= 70:
         grade = "厳選候補"
@@ -548,7 +655,11 @@ def race_confidence(racers: List[Racer]) -> Dict:
         "top_lane": top.lane,
         "top_name": top.name,
         "top_score": top.score,
+        "head_lane": head_top.lane,
+        "head_name": head_top.name,
+        "head_power": head_top.head_power,
         "top_gap": round(top_gap, 1),
+        "head_gap": round(head_gap, 1),
         "spread": round(spread, 1),
         "data_ok": data_ok_count,
         "display_ok": display_ok_count,
@@ -558,12 +669,16 @@ def race_confidence(racers: List[Racer]) -> Dict:
 
 def make_ai_table(racers: List[Racer]) -> pd.DataFrame:
     ranked = calculate_scores(racers)
+    calculate_head_power(racers)
+    ranked = sorted(racers, key=lambda x: x.score, reverse=True)
+
     return pd.DataFrame([{
         "順位": i,
         "艇": r.lane,
         "選手": r.name,
         "級別": r.klass,
         "AI指数": r.score,
+        "頭期待値": r.head_power,
         "展示": r.display_time,
         "展示ST": f"{'F' if r.tenji_f else ''}{r.tenji_st:.2f}" if r.tenji_st else 0,
         "平均ST": r.avg_st,
@@ -580,16 +695,17 @@ def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic
     r1, r2, r3 = racer_map[a], racer_map[b], racer_map[c]
     odd = odds.get(f"{a}-{b}-{c}", 0.0)
 
-    s = r1.score * 1.00 + r2.score * 0.70 + r3.score * 0.48
+    s = r1.head_power * 1.15 + r2.score * 0.62 + r3.score * 0.44
 
+    # 1頭優遇は残すが、頭期待値の方を主役にする
     if a == 1:
-        s += 7.0
+        s += 4.0
 
     if tactic["展開"] == "イン逃げ濃厚":
         if a == 1:
-            s += 8
+            s += 6
         else:
-            s -= 4
+            s -= 2
         if b in [2, 3, 4]:
             s += 3
         if c in [2, 3, 4, 5]:
@@ -598,16 +714,24 @@ def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic
     elif tactic["展開"] == "1飛び警戒":
         if a == 1:
             s -= 10
-        if a in [2, 3, 4]:
+        if a in [2, 3, 4, 5]:
             s += 9
         if 1 in [b, c]:
             s += 4
 
     elif tactic["展開"] == "穴期待":
-        if a in [3, 4]:
+        if a in [3, 4, 5]:
             s += 8
         if b in [1, 4, 5]:
             s += 3
+
+    # 頭期待値が高い艇は全艇で頭候補に押し上げる
+    if r1.head_power >= 78:
+        s += 8
+    elif r1.head_power >= 70:
+        s += 5
+    elif r1.head_power >= 62:
+        s += 2
 
     if r1.klass == "A1":
         s += 5.0
@@ -619,9 +743,11 @@ def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic
             s += 2.0
         if x.tenji_st and x.tenji_st <= 0.08:
             s += 1.5
+        if x.head_power >= 70:
+            s += 1.5
 
-    if a == 6 and r1.score < 95:
-        s -= 12.0
+    if a == 6 and r1.head_power < 78:
+        s -= 8.0
 
     if odd > 0:
         if 7.0 <= odd <= 35.0:
@@ -636,41 +762,60 @@ def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic
     return round(s, 2)
 
 
-def balance_predictions(df: pd.DataFrame, tactic: Dict, pick_count: int, preset: str) -> pd.DataFrame:
+def balance_predictions(df: pd.DataFrame, racers: List[Racer], tactic: Dict, pick_count: int, preset: str) -> pd.DataFrame:
     df = df.copy()
     df["頭"] = df["買い目"].astype(str).str.split("-").str[0].astype(int)
+
+    head_ranked = calculate_head_power(racers)
+    head_priority = [r.lane for r in head_ranked if r.head_power >= 58]
+    if 1 not in head_priority:
+        head_priority.append(1)
 
     if preset == "的中率重視":
         total = min(pick_count, 6)
         max_head1 = 3
+        min_head_candidates = 3
     elif preset == "標準":
         total = pick_count
         max_head1 = 4
+        min_head_candidates = 4
     else:
         total = max(pick_count, 12)
         max_head1 = 5
-
-    style = tactic["展開"]
-
-    if style == "イン逃げ濃厚":
-        head_priority = [1, 2, 3, 4]
-        quota = {1: max_head1, 2: 1, 3: 1, 4: 1}
-    elif style == "1飛び警戒":
-        head_priority = [2, 3, 4, 1, 5]
-        quota = {1: 2, 2: 2, 3: 2, 4: 2, 5: 1}
-    elif style == "穴期待":
-        head_priority = [1, 3, 4, 2, 5]
-        quota = {1: 2, 2: 1, 3: 2, 4: 2, 5: 1}
-    else:
-        head_priority = [1, 2, 3, 4, 5]
-        quota = {1: 2, 2: 2, 3: 2, 4: 1, 5: 1}
+        min_head_candidates = 5
 
     selected = []
     selected_keys = set()
     head_counts = {i: 0 for i in range(1, 7)}
 
-    # まず展開に応じた頭を分散して拾う
+    # 頭期待値上位を最低限分散して採用
+    for head in head_priority[:min_head_candidates]:
+        cand = df[df["頭"] == head].sort_values("評価", ascending=False)
+        for _, row in cand.iterrows():
+            key = row["買い目"]
+            if key in selected_keys:
+                continue
+            if head == 1 and head_counts[1] >= max_head1:
+                continue
+            selected.append(row)
+            selected_keys.add(key)
+            head_counts[head] += 1
+            break
+
+    # 展開に応じた追加配分
+    style = tactic["展開"]
+    if style == "イン逃げ濃厚":
+        quota = {1: max_head1, 2: 1, 3: 1, 4: 1, 5: 1}
+    elif style == "1飛び警戒":
+        quota = {1: 2, 2: 2, 3: 2, 4: 2, 5: 2}
+    elif style == "穴期待":
+        quota = {1: 2, 2: 1, 3: 2, 4: 2, 5: 2}
+    else:
+        quota = {1: 2, 2: 2, 3: 2, 4: 1, 5: 1}
+
     for head in head_priority:
+        if len(selected) >= total:
+            break
         limit = quota.get(head, 1)
         cand = df[df["頭"] == head].sort_values("評価", ascending=False)
 
@@ -690,10 +835,7 @@ def balance_predictions(df: pd.DataFrame, tactic: Dict, pick_count: int, preset:
             if len(selected) >= total:
                 break
 
-        if len(selected) >= total:
-            break
-
-    # 足りない分は高評価順。ただし1頭に偏りすぎない
+    # 足りない分は高評価順。ただし1頭だけに寄せない。
     for _, row in df.sort_values("評価", ascending=False).iterrows():
         if len(selected) >= total:
             break
@@ -709,18 +851,6 @@ def balance_predictions(df: pd.DataFrame, tactic: Dict, pick_count: int, preset:
         selected.append(row)
         selected_keys.add(key)
         head_counts[head] += 1
-
-    # それでも足りない場合は純粋高評価で補完
-    for _, row in df.sort_values("評価", ascending=False).iterrows():
-        if len(selected) >= total:
-            break
-
-        key = row["買い目"]
-        if key in selected_keys:
-            continue
-
-        selected.append(row)
-        selected_keys.add(key)
 
     out = pd.DataFrame(selected).drop(columns=["頭"], errors="ignore").reset_index(drop=True)
 
@@ -740,6 +870,9 @@ def balance_predictions(df: pd.DataFrame, tactic: Dict, pick_count: int, preset:
 
 
 def generate_predictions(racers: List[Racer], odds: Dict[str, float], pick_count: int = 10, preset: str = "標準") -> pd.DataFrame:
+    calculate_scores(racers)
+    calculate_head_power(racers)
+
     racer_map = {r.lane: r for r in racers}
     tactic = tactic_analysis(racers)
 
@@ -754,7 +887,7 @@ def generate_predictions(racers: List[Racer], odds: Dict[str, float], pick_count
         })
 
     raw_df = pd.DataFrame(rows).sort_values("評価", ascending=False).reset_index(drop=True)
-    df = balance_predictions(raw_df, tactic, pick_count, preset)
+    df = balance_predictions(raw_df, racers, tactic, pick_count, preset)
 
     conf = race_confidence(racers)["confidence"]
     df["勝負度"] = conf
@@ -836,12 +969,16 @@ def analyze_single_race_cached(jcd: str, rno: int, hd: str, use_before: bool, us
         "勝負度": conf["confidence"],
         "判定": conf["grade"],
         "展開": tactic["展開"],
+        "頭期待1位": tactic["頭期待1位"],
         "イン逃げ度": tactic["イン逃げ度"],
         "1飛び警戒": tactic["1飛び警戒"],
         "穴期待度": tactic["穴期待度"],
         "本命": f"{conf['top_lane']}号艇 {conf['top_name']}",
+        "頭候補": f"{conf['head_lane']}号艇 {conf['head_name']}",
         "本命指数": conf["top_score"],
+        "頭期待値": conf["head_power"],
         "上位差": conf["top_gap"],
+        "頭期待差": conf["head_gap"],
         "全体差": conf["spread"],
         "展示取得": conf["display_ok"],
         "データ取得": conf["data_ok"],
@@ -860,14 +997,15 @@ def build_note_text(event_name: str, place: str, rno: str, ai_df: pd.DataFrame, 
 
     lines.append(title)
     lines.append("")
-    lines.append(f"展開判定：{tactic['展開']}｜イン逃げ度 {tactic['イン逃げ度']}%｜1飛び警戒 {tactic['1飛び警戒']}%")
+    lines.append(f"展開判定：{tactic['展開']}｜頭期待1位：{tactic['頭期待1位']}")
+    lines.append(f"イン逃げ度 {tactic['イン逃げ度']}%｜1飛び警戒 {tactic['1飛び警戒']}%")
     lines.append("")
     lines.append("【指数表・印】")
 
     marks = ["◎", "○", "▲", "△", "☆", "消"]
     for i, row in ai_df.iterrows():
         mark = marks[i] if i < len(marks) else ""
-        lines.append(f"{mark} {int(row['艇'])}号艇 {row['選手']}｜指数 {row['AI指数']}")
+        lines.append(f"{mark} {int(row['艇'])}号艇 {row['選手']}｜指数 {row['AI指数']}｜頭期待 {row['頭期待値']}")
 
     lines.append("")
     lines.append("【買い目】")
@@ -877,7 +1015,7 @@ def build_note_text(event_name: str, place: str, rno: str, ai_df: pd.DataFrame, 
 
     lines.append("")
     lines.append("※指数表・印とは連動していない場合もございます。")
-    lines.append("※オッズ未取得の場合は指数・展示・成績を中心に評価しています。")
+    lines.append("※オッズ未取得の場合は指数・展示・成績・頭期待値を中心に評価しています。")
     return "\n".join(lines)
 
 
@@ -915,7 +1053,7 @@ def run_single_race_view(url: str, use_before: bool, use_odds: bool, pick_count:
     col1, col2, col3 = st.columns(3)
     col1.metric("勝負度", f"{conf['confidence']}%")
     col2.metric("展開", tactic["展開"])
-    col3.metric("本命", f"{conf['top_lane']}号艇")
+    col3.metric("頭期待1位", tactic["頭期待1位"])
 
     st.info(f"展開コメント：{tactic['コメント']}")
 
@@ -929,7 +1067,7 @@ def run_single_race_view(url: str, use_before: bool, use_odds: bool, pick_count:
     st.text_area(
         "コピー用",
         value=build_note_text(meta.get("event_name", ""), place, rno, ai_df, pred_df, tactic),
-        height=300,
+        height=320,
     )
 
     if debug:
@@ -991,8 +1129,9 @@ def venue_checkbox_selector(detected: List[str]) -> List[str]:
 def compact_columns(df: pd.DataFrame) -> pd.DataFrame:
     cols = [
         "場", "R", "レース", "勝負度", "判定", "展開",
-        "イン逃げ度", "1飛び警戒", "穴期待度",
-        "本命", "本命指数", "上位差", "全体差",
+        "頭期待1位", "イン逃げ度", "1飛び警戒", "穴期待度",
+        "本命", "頭候補", "本命指数", "頭期待値",
+        "上位差", "頭期待差", "全体差",
         "展示取得", "データ取得", "買い目候補",
     ]
     return df[[c for c in cols if c in df.columns]]
@@ -1001,7 +1140,8 @@ def compact_columns(df: pd.DataFrame) -> pd.DataFrame:
 def detail_columns(df: pd.DataFrame) -> pd.DataFrame:
     cols = [
         "場", "R", "レース", "勝負度", "判定", "展開",
-        "本命", "本命指数", "上位差", "全体差",
+        "頭期待1位", "本命", "頭候補", "本命指数", "頭期待値",
+        "上位差", "頭期待差", "全体差",
         "買い目候補", "開催名", "URL",
     ]
     return df[[c for c in cols if c in df.columns]]
@@ -1013,8 +1153,8 @@ def show_saved_results(min_conf: int, max_rows: int):
         return
 
     df_all = st.session_state["last_results_df"]
-    df_best = df_all[df_all["勝負度"] >= min_conf].sort_values(["勝負度", "本命指数"], ascending=False).head(max_rows)
-    df_hot = df_all[df_all["判定"].isin(["熱🔥", "厚張り候補"])].sort_values(["勝負度", "本命指数"], ascending=False)
+    df_best = df_all[df_all["勝負度"] >= min_conf].sort_values(["勝負度", "頭期待値"], ascending=False).head(max_rows)
+    df_hot = df_all[df_all["判定"].isin(["熱🔥", "厚張り候補"])].sort_values(["勝負度", "頭期待値"], ascending=False)
 
     tab1, tab2, tab3, tab4 = st.tabs(["全レース一覧", "本日の厳選レース", "熱🔥・厚張り", "開催場別"])
 
@@ -1034,10 +1174,10 @@ def show_saved_results(min_conf: int, max_rows: int):
             for _, row in df_best.iterrows():
                 lines.append(
                     f"{row['判定']}｜{row['レース']}｜勝負度 {row['勝負度']}%｜"
-                    f"展開 {row['展開']}｜本命 {row['本命']}｜候補 {row['買い目候補']}"
+                    f"展開 {row['展開']}｜頭期待 {row['頭期待1位']}｜候補 {row['買い目候補']}"
                 )
             lines.append("")
-            lines.append("※指数・展示・成績・展開判定を中心に自動評価しています。")
+            lines.append("※指数・展示・成績・頭期待値を中心に自動評価しています。")
             lines.append("※指数表・印とは連動していない場合もございます。")
             st.text_area("Note貼り付け用", value="\n".join(lines), height=300)
 
@@ -1052,7 +1192,7 @@ def show_saved_results(min_conf: int, max_rows: int):
         st.markdown("### 開催場別")
         place_choice = st.selectbox("開催場を選択", sorted(df_all["場"].unique().tolist()))
         df_place = df_all[df_all["場"] == place_choice].sort_values(["R"])
-        df_place_best = df_place[df_place["勝負度"] >= min_conf].sort_values(["勝負度", "R"], ascending=[False, True])
+        df_place_best = df_place[df_place["勝負度"] >= min_conf].sort_values(["勝負度", "頭期待値"], ascending=[False, False])
 
         st.markdown(f"#### {place_choice} 全レース")
         st.dataframe(compact_columns(df_place), width="stretch", hide_index=True)
