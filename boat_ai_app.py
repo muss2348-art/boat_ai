@@ -14,7 +14,7 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-APP_VERSION = "v10.5 ZIP版・紐抜け対策AI"
+APP_VERSION = "v10.6 軽量モード・段階解析版"
 JST = timezone(timedelta(hours=9))
 
 JCD_MAP = {
@@ -788,43 +788,120 @@ def show_saved_results(min_conf: int, max_rows: int):
         else: st.dataframe(detail_columns(df_place_best), width="stretch", hide_index=True)
 
 
-def run_selection_screen(hd: str, use_before: bool, use_odds: bool, pick_count: int, preset: str):
+def run_selection_screen(hd: str, use_before: bool, use_odds: bool, pick_count: int, preset: str, light_mode: bool, prefilter_conf: int, max_scan_races: int):
     st.markdown("### 厳選AI")
     detected = detect_today_venues(hd)
     if detected:
-        st.success(f"開催場を自動検出：{len(detected)}場"); st.write(" / ".join([JCD_MAP[j] for j in detected]))
-    else: st.warning("開催場の自動検出に失敗しました。手動で選んでください。")
+        st.success(f"開催場を自動検出：{len(detected)}場")
+        st.write(" / ".join([JCD_MAP[j] for j in detected]))
+    else:
+        st.warning("開催場の自動検出に失敗しました。手動で選んでください。")
+
     selected_jcds = venue_checkbox_selector(detected)
     st.divider()
+
     col_a, col_b, col_c = st.columns(3)
-    with col_a: min_conf = st.slider("厳選表示の最低勝負度", 0, 100, 65)
-    with col_b: max_rows = st.slider("厳選最大表示数", 5, 80, 30)
-    with col_c: race_range = st.slider("巡回R", 1, 12, (1, 12))
+    with col_a:
+        min_conf = st.slider("厳選表示の最低勝負度", 0, 100, 65)
+    with col_b:
+        max_rows = st.slider("厳選最大表示数", 5, 80, 30)
+    with col_c:
+        race_range = st.slider("巡回R", 1, 12, (1, 12))
+
+    expected_total = len(selected_jcds) * (race_range[1] - race_range[0] + 1)
     st.info(f"選択中：{len(selected_jcds)}場 / {', '.join([JCD_MAP[j] for j in selected_jcds]) if selected_jcds else 'なし'}")
+
+    if light_mode:
+        st.caption(
+            f"軽量モードON：まず出走表だけで最大{max_scan_races}レースを仮解析し、"
+            f"勝負度{prefilter_conf}%以上だけ直前情報を取り直します。"
+        )
+    else:
+        st.caption("通常モード：選択レースをそのまま解析します。選択数が多いと重くなります。")
+
+    if expected_total > max_scan_races and light_mode:
+        st.warning(f"対象が{expected_total}レースあります。軽量化のため先頭{max_scan_races}レースまで解析します。")
+    elif expected_total > 72 and not light_mode:
+        st.warning("解析対象が多いです。重い場合は軽量モードON、直前情報OFF、巡回R絞り込みがおすすめです。")
+
     col_run, col_clear = st.columns(2)
-    with col_run: run_button = st.button("厳選AIを実行 / 再解析", type="primary")
+    with col_run:
+        run_button = st.button("厳選AIを実行 / 再解析", type="primary")
     with col_clear:
         if st.button("履歴をクリア"):
-            st.session_state["last_results_df"] = None; st.session_state["last_hd"] = None; st.rerun()
+            st.session_state["last_results_df"] = None
+            st.session_state["last_hd"] = None
+            st.rerun()
+
     if run_button:
         if not selected_jcds:
-            st.warning("開催場を選んでください。"); return
-        results = []
-        total = len(selected_jcds) * (race_range[1] - race_range[0] + 1)
-        progress = st.progress(0); status = st.empty(); count = 0
+            st.warning("開催場を選んでください。")
+            return
+
+        tasks = []
         for jcd in selected_jcds:
             for rno in range(race_range[0], race_range[1] + 1):
-                count += 1; status.write(f"解析中：{JCD_MAP.get(jcd, jcd)} {rno}R"); progress.progress(min(1.0, count / max(total, 1)))
-                try: results.append(analyze_single_race_cached(jcd, rno, hd, use_before, use_odds, pick_count, preset))
-                except Exception: continue
-        progress.empty(); status.empty()
-        if not results:
-            st.error("解析できるレースがありませんでした。"); return
-        df_all = pd.DataFrame(results).sort_values(["場", "R"])
-        st.session_state["last_results_df"] = df_all; st.session_state["last_hd"] = hd
-        st.success("解析結果を保存しました。予想画面に移動して戻っても残ります。")
-    show_saved_results(min_conf, max_rows)
+                tasks.append((jcd, rno))
 
+        if light_mode and len(tasks) > max_scan_races:
+            tasks = tasks[:max_scan_races]
+
+        results = []
+        total = len(tasks)
+        progress = st.progress(0)
+        status = st.empty()
+
+        if light_mode:
+            prelim_results = []
+            # 1段階目：出走表だけで高速仮解析
+            for idx, (jcd, rno) in enumerate(tasks, start=1):
+                status.write(f"軽量解析中：{JCD_MAP.get(jcd, jcd)} {rno}R")
+                progress.progress(min(1.0, idx / max(total, 1)))
+                try:
+                    prelim = analyze_single_race_cached(jcd, rno, hd, False, use_odds, pick_count, preset)
+                    prelim_results.append((jcd, rno, prelim))
+                except Exception:
+                    continue
+
+            # 2段階目：有望レースだけ直前情報で再解析
+            refine_targets = [(jcd, rno) for jcd, rno, res in prelim_results if use_before and res.get("勝負度", 0) >= prefilter_conf]
+            refined_map = {}
+            if refine_targets:
+                progress = st.progress(0)
+                status.write(f"有望レースのみ直前情報を取得：{len(refine_targets)}レース")
+                for idx, (jcd, rno) in enumerate(refine_targets, start=1):
+                    status.write(f"直前情報込み再解析：{JCD_MAP.get(jcd, jcd)} {rno}R")
+                    progress.progress(min(1.0, idx / max(len(refine_targets), 1)))
+                    try:
+                        refined_map[(jcd, rno)] = analyze_single_race_cached(jcd, rno, hd, True, use_odds, pick_count, preset)
+                    except Exception:
+                        pass
+
+            for jcd, rno, prelim in prelim_results:
+                results.append(refined_map.get((jcd, rno), prelim))
+        else:
+            # 通常解析：選択レースをそのまま解析
+            for idx, (jcd, rno) in enumerate(tasks, start=1):
+                status.write(f"解析中：{JCD_MAP.get(jcd, jcd)} {rno}R")
+                progress.progress(min(1.0, idx / max(total, 1)))
+                try:
+                    results.append(analyze_single_race_cached(jcd, rno, hd, use_before, use_odds, pick_count, preset))
+                except Exception:
+                    continue
+
+        progress.empty()
+        status.empty()
+
+        if not results:
+            st.error("解析できるレースがありませんでした。")
+            return
+
+        df_all = pd.DataFrame(results).sort_values(["場", "R"])
+        st.session_state["last_results_df"] = df_all
+        st.session_state["last_hd"] = hd
+        st.success("解析結果を保存しました。予想画面に移動して戻っても残ります。")
+
+    show_saved_results(min_conf, max_rows)
 
 def main():
     st.set_page_config(page_title="BOATRACE AI", page_icon="🚤", layout="wide")
@@ -834,16 +911,20 @@ def main():
     today = datetime.now(JST).strftime("%Y%m%d")
     st.sidebar.header("共通設定")
     hd = st.sidebar.text_input("日付 hd", value=today)
-    st.sidebar.caption("軽量化したい場合は、直前情報OFF・巡回Rを絞るのがおすすめです。")
+    st.sidebar.caption("軽量化したい場合は、軽量モードON・直前情報OFF・巡回Rを絞るのがおすすめです。")
+    light_mode = st.sidebar.checkbox("軽量モード", value=True)
     use_before = st.sidebar.checkbox("直前情報を取得", value=True)
     use_odds = st.sidebar.checkbox("オッズ取得を試す", value=False)
+
+    prefilter_conf = st.sidebar.slider("直前情報を取り直す最低勝負度", 0, 100, 58)
+    max_scan_races = st.sidebar.slider("最大解析レース数", 12, 144, 60, step=12)
     preset = st.sidebar.radio("買い目プリセット", ["的中率重視", "標準", "攻め"], index=0)
     default_count = 5 if preset == "的中率重視" else 10 if preset == "標準" else 14
     pick_count = st.sidebar.slider("買い目表示点数", 3, 20, default_count)
     debug = st.sidebar.checkbox("デバッグ表示", value=False)
     mode = st.radio("モード", ["厳選AI", "予想"], horizontal=True)
     if mode == "厳選AI":
-        run_selection_screen(hd, use_before, use_odds, pick_count, preset)
+        run_selection_screen(hd, use_before, use_odds, pick_count, preset, light_mode, prefilter_conf, max_scan_races)
     else:
         default_url = f"https://www.boatrace.jp/owpc/pc/race/racelist?rno=2&jcd=20&hd={hd}"
         url = st.text_input("BOATRACE公式 出走表URL", value=default_url)
