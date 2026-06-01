@@ -16,7 +16,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-APP_VERSION = "v10.8 3着期待値AI・紐抜け対策v2"
+APP_VERSION = "v10.9 相手期待値AI・買い目生成改善版"
 
 JST = timezone(timedelta(hours=9))
 
@@ -55,6 +55,7 @@ class Racer:
     tenji_f: bool = False
     score: float = 0.0
     head_power: float = 0.0
+    place_power: float = 0.0
     third_power: float = 0.0
     data_status: str = ""
 
@@ -463,13 +464,13 @@ def string_power(r: Racer, ranked: List[Racer]) -> float:
 
 
 
-def calculate_third_power(racers: List[Racer]) -> List[Racer]:
+def calculate_place_power(racers: List[Racer]) -> List[Racer]:
     """
-    3着期待値AI。
-    頭や2着では弱くても、3着に残したい艇を評価する。
-    展示・展示ST・平均ST・モーター・ボート・当地を重視。
+    相手期待値AI。
+    頭ではなく、2着/3着の相手として残す力を評価する。
+    AI指数よりも展示・ST・機力・当地・ボートを重視する。
     """
-    ranked = calculate_scores(racers)
+    calculate_scores(racers)
     calculate_head_power(racers)
 
     displays = [r.display_time for r in racers if r.display_time > 0]
@@ -480,78 +481,143 @@ def calculate_third_power(racers: List[Racer]) -> List[Racer]:
     top_lanes = [x.lane for x in score_sorted[:2]]
 
     for r in racers:
-        tp = 35.0
-        tp += max(0, r.score - 80) * 0.22
+        pp = 38.0
 
-        if r.lane in bottom_lanes:
-            tp += 10
+        # 相手は指数を見すぎない。ただし上位は最低限評価。
+        pp += max(0, r.score - 80) * 0.18
+
         if r.lane in top_lanes:
-            tp += 3
+            pp += 4
 
+        # 下位指数でも相手なら拾う。
+        if r.lane in bottom_lanes:
+            pp += 10
+
+        # 展示タイム重視。
         if r.display_time and avg_display:
             if r.display_time <= avg_display - 0.08:
-                tp += 14
+                pp += 14
             elif r.display_time <= avg_display - 0.05:
-                tp += 10
+                pp += 10
             elif r.display_time <= avg_display - 0.03:
-                tp += 6
-            elif r.display_time >= avg_display + 0.08:
-                tp -= 4
+                pp += 6
+            elif r.display_time >= avg_display + 0.09:
+                pp -= 5
 
+        # 展示ST・平均ST。
         if r.tenji_st:
             if r.tenji_st <= 0.06:
-                tp += 9
+                pp += 9
             elif r.tenji_st <= 0.10:
-                tp += 6
+                pp += 6
             elif r.tenji_st <= 0.14:
-                tp += 3
+                pp += 3
             elif r.tenji_st >= 0.20:
-                tp -= 3
+                pp -= 4
 
         if r.tenji_f:
-            tp += 2
+            # F表示でも、攻め気配として相手では少し残す。
+            pp += 2
 
         if r.avg_st <= 0.14:
-            tp += 8
+            pp += 8
         elif r.avg_st <= 0.16:
-            tp += 5
+            pp += 5
         elif r.avg_st <= 0.18:
-            tp += 2
+            pp += 2
         elif r.avg_st >= 0.21:
-            tp -= 4
+            pp -= 5
 
+        # 機力・ボート・当地。
         if r.motor_2 >= 42:
-            tp += 10
+            pp += 10
         elif r.motor_2 >= 36:
-            tp += 6
+            pp += 7
         elif r.motor_2 >= 30:
-            tp += 3
+            pp += 4
         elif r.motor_2 and r.motor_2 <= 22:
-            tp -= 4
+            pp -= 4
 
         if r.boat_2 >= 42:
-            tp += 7
+            pp += 7
         elif r.boat_2 >= 35:
-            tp += 4
+            pp += 4
         elif r.boat_2 and r.boat_2 <= 22:
-            tp -= 2
+            pp -= 2
 
         if r.local_2 >= 45:
-            tp += 8
+            pp += 8
         elif r.local_2 >= 35:
-            tp += 5
+            pp += 5
         elif r.local_2 >= 25:
-            tp += 2
+            pp += 2
         elif r.local_2 and r.local_2 <= 12:
-            tp -= 4
+            pp -= 4
 
         if r.klass == "A1":
-            tp += 5
+            pp += 6
         elif r.klass == "A2":
+            pp += 3
+
+        # 5・6号艇は頭では厳しくても相手なら拾う。
+        if r.lane in [5, 6]:
+            pp += 4
+
+        r.place_power = round(max(0, min(100, pp)), 1)
+
+    return sorted(racers, key=lambda x: x.place_power, reverse=True)
+
+
+def calculate_third_power(racers: List[Racer]) -> List[Racer]:
+    """
+    3着期待値AI。
+    相手期待値をベースに、3着で残す力をさらに評価する。
+    """
+    calculate_scores(racers)
+    calculate_head_power(racers)
+    calculate_place_power(racers)
+
+    displays = [r.display_time for r in racers if r.display_time > 0]
+    avg_display = sum(displays) / max(1, len(displays))
+
+    score_sorted = sorted(racers, key=lambda x: x.score, reverse=True)
+    bottom_lanes = [x.lane for x in score_sorted[-2:]]
+
+    for r in racers:
+        tp = 30.0
+        tp += r.place_power * 0.55
+
+        # 指数下位は3着として強制的に少し底上げ。
+        if r.lane in bottom_lanes:
+            tp += 12
+
+        # 展示・展示STが良ければ3着残りを強化。
+        if r.display_time and avg_display:
+            if r.display_time <= avg_display - 0.06:
+                tp += 8
+            elif r.display_time <= avg_display - 0.03:
+                tp += 4
+
+        if r.tenji_st:
+            if r.tenji_st <= 0.08:
+                tp += 6
+            elif r.tenji_st <= 0.12:
+                tp += 3
+
+        if r.motor_2 >= 38:
+            tp += 5
+        elif r.motor_2 >= 32:
             tp += 3
 
+        if r.boat_2 >= 38:
+            tp += 4
+
+        if r.local_2 >= 35:
+            tp += 4
+
+        # 5・6号艇の3着残りを少し厚くする。
         if r.lane in [5, 6]:
-            tp += 3
+            tp += 4
 
         r.third_power = round(max(0, min(100, tp)), 1)
 
@@ -561,6 +627,8 @@ def calculate_third_power(racers: List[Racer]) -> List[Racer]:
 def tactic_analysis(racers: List[Racer]) -> Dict:
     ranked = calculate_scores(racers)
     head_ranked = calculate_head_power(racers)
+    calculate_place_power(racers)
+    calculate_third_power(racers)
     by_lane = {r.lane: r for r in racers}
     one = by_lane.get(1)
     two = by_lane.get(2)
@@ -721,6 +789,7 @@ def race_confidence(racers: List[Racer]) -> Dict:
 def make_ai_table(racers: List[Racer]) -> pd.DataFrame:
     calculate_scores(racers)
     calculate_head_power(racers)
+    calculate_place_power(racers)
     calculate_third_power(racers)
     ranked = sorted(racers, key=lambda x: x.score, reverse=True)
     return pd.DataFrame([{
@@ -730,6 +799,7 @@ def make_ai_table(racers: List[Racer]) -> pd.DataFrame:
         "級別": r.klass,
         "AI指数": r.score,
         "頭期待値": r.head_power,
+        "相手期待値": r.place_power,
         "3着期待値": r.third_power,
         "展示": r.display_time,
         "展示ST": f"{'F' if r.tenji_f else ''}{r.tenji_st:.2f}" if r.tenji_st else 0,
@@ -745,17 +815,20 @@ def make_ai_table(racers: List[Racer]) -> pd.DataFrame:
 def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic: Dict, odds: Dict[str, float]) -> float:
     a, b, c = combo
     r1, r2, r3 = racer_map[a], racer_map[b], racer_map[c]
-    ranked = calculate_scores(list(racer_map.values()))
-    calculate_head_power(list(racer_map.values()))
-    calculate_third_power(list(racer_map.values()))
+    racers = list(racer_map.values())
+    ranked = calculate_scores(racers)
+    calculate_head_power(racers)
+    calculate_place_power(racers)
+    calculate_third_power(racers)
+
     r2_string = string_power(r2, ranked)
     r3_string = string_power(r3, ranked)
     odd = odds.get(f"{a}-{b}-{c}", 0.0)
 
-    # v10.8：3着はAI指数より3着期待値を強めに使う
-    s = r1.head_power * 1.06 + r2.score * 0.48 + r3.third_power * 0.58
-    s += r2_string * 0.16
-    s += r3_string * 0.18
+    # v10.9：頭・相手・3着を役割分離
+    s = r1.head_power * 1.02 + r2.place_power * 0.66 + r3.third_power * 0.62
+    s += r2_string * 0.10
+    s += r3_string * 0.10
     if a == 1:
         s += 4.0
     if tactic["展開"] == "イン逃げ濃厚":
@@ -796,9 +869,13 @@ def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic
             s += 1.5
         if x.head_power >= 70:
             s += 1.5
-        if x.third_power >= 75:
+        if x.place_power >= 75:
             s += 3.0
-        elif x.third_power >= 65:
+        elif x.place_power >= 65:
+            s += 1.5
+        if x.third_power >= 78:
+            s += 3.0
+        elif x.third_power >= 68:
             s += 1.5
     if a == 6 and r1.head_power < 78:
         s -= 8.0
@@ -909,20 +986,50 @@ def balance_predictions(df: pd.DataFrame, racers: List[Racer], tactic: Dict, pic
             selected_keys.add(key)
             break
 
-    # v10.8 紐抜け対策v2：
-    # 3着期待値が高い艇を3着に置いた買い目を最低1〜2点追加。
-    third_ranked = calculate_third_power(racers)
-    third_targets = []
-    for r in third_ranked:
-        if r.third_power >= 62:
-            third_targets.append(r.lane)
+    # v10.9 相手期待値AI：
+    # 頭候補 × 相手候補で、指数下位でも相手期待値が高い艇を2着/3着へ強制追加。
+    head_ranked_now = calculate_head_power(racers)
+    place_ranked_now = calculate_place_power(racers)
+    third_ranked_now = calculate_third_power(racers)
 
-    for target_lane in third_targets[:2]:
+    strong_heads = [r.lane for r in head_ranked_now if r.head_power >= 70]
+    if not strong_heads:
+        strong_heads = [head_ranked_now[0].lane]
+
+    place_targets = [r.lane for r in place_ranked_now if r.place_power >= 62]
+    third_targets = [r.lane for r in third_ranked_now if r.third_power >= 62]
+
+    # 2着に相手期待値上位を入れる
+    for h in strong_heads[:2]:
         if len(selected) >= total:
             break
+        for p in place_targets[:3]:
+            if len(selected) >= total:
+                break
+            if p == h:
+                continue
+
+            cand = df[
+                df["買い目"].astype(str).str.startswith(f"{h}-{p}-")
+            ].sort_values("評価", ascending=False)
+
+            for _, row in cand.iterrows():
+                key = row["買い目"]
+                if key in selected_keys:
+                    continue
+                selected.append(row)
+                selected_keys.add(key)
+                break
+
+    # 3着に3着期待値上位を入れる
+    for t in third_targets[:3]:
+        if len(selected) >= total:
+            break
+
         cand = df[
-            df["買い目"].astype(str).str.endswith(f"-{target_lane}")
+            df["買い目"].astype(str).str.endswith(f"-{t}")
         ].sort_values("評価", ascending=False)
+
         for _, row in cand.iterrows():
             key = row["買い目"]
             if key in selected_keys:
@@ -949,6 +1056,7 @@ def balance_predictions(df: pd.DataFrame, racers: List[Racer], tactic: Dict, pic
 def generate_predictions(racers: List[Racer], odds: Dict[str, float], pick_count: int = 10, preset: str = "標準") -> pd.DataFrame:
     calculate_scores(racers)
     calculate_head_power(racers)
+    calculate_place_power(racers)
     calculate_third_power(racers)
     racer_map = {r.lane: r for r in racers}
     tactic = tactic_analysis(racers)
@@ -967,23 +1075,30 @@ def generate_predictions(racers: List[Racer], odds: Dict[str, float], pick_count
     conf = conf_info["confidence"]
     grade = conf_info["grade"]
 
-    # v10.8：レース判定別に買い目点数を自動調整
+    # v10.9：判定別に買い目点数を自動調整
     if grade == "熱🔥":
-        auto_count = 4
-    elif grade == "厚張り候補":
         auto_count = 5
+    elif grade == "厚張り候補":
+        auto_count = 6
     elif grade == "厳選候補":
-        auto_count = 7
+        auto_count = 8
     elif grade == "穴期待":
         auto_count = 10
     else:
         auto_count = max(3, min(pick_count, 5))
 
-    effective_count = min(max(pick_count, auto_count), 20) if preset == "攻め" else min(auto_count, pick_count)
+    if preset == "攻め":
+        effective_count = min(max(pick_count, auto_count), 20)
+    elif preset == "的中率重視":
+        effective_count = min(auto_count, pick_count)
+    else:
+        effective_count = min(max(auto_count, pick_count), 12)
 
     df = balance_predictions(raw_df, racers, tactic, effective_count, preset)
+
     if tactic["展開"] == "混戦":
         df = df.head(max(3, effective_count // 2))
+
     df["勝負度"] = conf
     df["厚張りAI"] = ""
     if conf >= 84:
@@ -1058,6 +1173,8 @@ def analyze_single_race_cached(jcd: str, rno: int, hd: str, use_before: bool, us
         "頭候補": f"{conf['head_lane']}号艇 {conf['head_name']}",
         "本命指数": conf["top_score"],
         "頭期待値": conf["head_power"],
+        "相手期待1位": f"{calculate_place_power(racers)[0].lane}号艇 {calculate_place_power(racers)[0].name}",
+        "3着期待1位": f"{calculate_third_power(racers)[0].lane}号艇 {calculate_third_power(racers)[0].name}",
         "上位差": conf["top_gap"],
         "頭期待差": conf["head_gap"],
         "全体差": conf["spread"],
@@ -1083,7 +1200,7 @@ def build_note_text(event_name: str, place: str, rno: str, ai_df: pd.DataFrame, 
     marks = ["◎", "○", "▲", "△", "☆", "消"]
     for i, row in ai_df.iterrows():
         mark = marks[i] if i < len(marks) else ""
-        lines.append(f"{mark} {int(row['艇'])}号艇 {row['選手']}｜指数 {row['AI指数']}｜頭期待 {row['頭期待値']}｜3着期待 {row.get('3着期待値', 0)}")
+        lines.append(f"{mark} {int(row['艇'])}号艇 {row['選手']}｜指数 {row['AI指数']}｜頭期待 {row['頭期待値']}｜相手期待 {row.get('相手期待値', 0)}｜3着期待 {row.get('3着期待値', 0)}")
     lines.append("")
     lines.append("【買い目】")
     for _, row in pred_df.iterrows():
@@ -1182,7 +1299,7 @@ def compact_columns(df: pd.DataFrame) -> pd.DataFrame:
     cols = [
         "場", "R", "レース", "勝負度", "判定", "展開",
         "頭期待1位", "イン逃げ度", "1飛び警戒", "穴期待度",
-        "本命", "頭候補", "本命指数", "頭期待値",
+        "本命", "頭候補", "本命指数", "頭期待値", "相手期待1位", "3着期待1位",
         "上位差", "頭期待差", "全体差",
         "展示取得", "データ取得", "買い目候補",
     ]
@@ -1192,7 +1309,7 @@ def compact_columns(df: pd.DataFrame) -> pd.DataFrame:
 def detail_columns(df: pd.DataFrame) -> pd.DataFrame:
     cols = [
         "場", "R", "レース", "勝負度", "判定", "展開",
-        "頭期待1位", "本命", "頭候補", "本命指数", "頭期待値",
+        "頭期待1位", "本命", "頭候補", "本命指数", "頭期待値", "相手期待1位", "3着期待1位",
         "上位差", "頭期待差", "全体差",
         "買い目候補", "開催名", "URL",
     ]
