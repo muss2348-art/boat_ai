@@ -16,7 +16,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 
-APP_VERSION = "v10.9 相手期待値AI・買い目生成改善版"
+APP_VERSION = "v10.10 買い目バランス調整版"
 
 JST = timezone(timedelta(hours=9))
 
@@ -892,153 +892,155 @@ def combo_score(combo: Tuple[int, int, int], racer_map: Dict[int, Racer], tactic
 
 
 def balance_predictions(df: pd.DataFrame, racers: List[Racer], tactic: Dict, pick_count: int, preset: str) -> pd.DataFrame:
+    """
+    v10.10 買い目バランスAI。
+    ・頭期待値上位を中心にする
+    ・指数3〜4位を最低1点ずつ残す
+    ・相手期待値/3着期待値で下位艇も拾う
+    ・ただし最下位/穴紐の拾いすぎを制限する
+    """
     df = df.copy()
     df["頭"] = df["買い目"].astype(str).str.split("-").str[0].astype(int)
+    df["2着"] = df["買い目"].astype(str).str.split("-").str[1].astype(int)
+    df["3着"] = df["買い目"].astype(str).str.split("-").str[2].astype(int)
+
+    score_ranked = calculate_scores(racers)
     head_ranked = calculate_head_power(racers)
-    head_priority = [r.lane for r in head_ranked if r.head_power >= 58]
-    if 1 not in head_priority:
-        head_priority.append(1)
+    place_ranked = calculate_place_power(racers)
+    third_ranked = calculate_third_power(racers)
+
+    score_order = [r.lane for r in score_ranked]
+    mid_lanes = score_order[2:4]      # 指数3位・4位
+    bottom_lanes = score_order[-2:]   # 指数5位・6位
+
+    strong_heads = [r.lane for r in head_ranked if r.head_power >= 70]
+    if not strong_heads:
+        strong_heads = [head_ranked[0].lane]
+
+    place_targets = [r.lane for r in place_ranked if r.place_power >= 60]
+    for lane in mid_lanes:
+        if lane not in place_targets:
+            place_targets.append(lane)
+
+    third_targets = [r.lane for r in third_ranked if r.third_power >= 60]
+    for lane in mid_lanes:
+        if lane not in third_targets:
+            third_targets.append(lane)
+
     if preset == "的中率重視":
         total = min(pick_count, 6)
         max_head1 = 3
-        min_head_candidates = 3
+        max_bottom_uses = 1
     elif preset == "標準":
         total = pick_count
         max_head1 = 4
-        min_head_candidates = 4
+        max_bottom_uses = 2
     else:
         total = max(pick_count, 12)
         max_head1 = 5
-        min_head_candidates = 5
+        max_bottom_uses = 3
+
     selected = []
     selected_keys = set()
     head_counts = {i: 0 for i in range(1, 7)}
-    for head in head_priority[:min_head_candidates]:
-        cand = df[df["頭"] == head].sort_values("評価", ascending=False)
-        for _, row in cand.iterrows():
-            key = row["買い目"]
-            if key in selected_keys:
-                continue
-            if head == 1 and head_counts[1] >= max_head1:
-                continue
-            selected.append(row)
-            selected_keys.add(key)
-            head_counts[head] += 1
-            break
-    style = tactic["展開"]
-    if style == "イン逃げ濃厚":
-        quota = {1: max_head1, 2: 1, 3: 1, 4: 1, 5: 1}
-    elif style == "1飛び警戒":
-        quota = {1: 2, 2: 2, 3: 2, 4: 2, 5: 2}
-    elif style == "穴期待":
-        quota = {1: 2, 2: 1, 3: 2, 4: 2, 5: 2}
-    else:
-        quota = {1: 2, 2: 2, 3: 2, 4: 1, 5: 1}
-    for head in head_priority:
-        if len(selected) >= total:
-            break
-        limit = quota.get(head, 1)
-        cand = df[df["頭"] == head].sort_values("評価", ascending=False)
-        for _, row in cand.iterrows():
-            key = row["買い目"]
-            if key in selected_keys:
-                continue
-            if head == 1 and head_counts[1] >= max_head1:
-                continue
-            if head_counts[head] >= limit:
-                continue
-            selected.append(row)
-            selected_keys.add(key)
-            head_counts[head] += 1
-            if len(selected) >= total:
-                break
-    for _, row in df.sort_values("評価", ascending=False).iterrows():
-        if len(selected) >= total:
-            break
+    bottom_use_count = 0
+    mid_use_count = {lane: 0 for lane in mid_lanes}
+
+    def add_row(row, allow_extra_bottom: bool = False) -> bool:
+        nonlocal bottom_use_count
+
         key = row["買い目"]
-        head = int(row["頭"])
         if key in selected_keys:
-            continue
+            return False
+
+        head = int(row["頭"])
+        second = int(row["2着"])
+        third = int(row["3着"])
+
         if head == 1 and head_counts[1] >= max_head1:
-            continue
+            return False
+
+        contains_bottom = (head in bottom_lanes) or (second in bottom_lanes) or (third in bottom_lanes)
+        if contains_bottom and not allow_extra_bottom and bottom_use_count >= max_bottom_uses:
+            return False
+
         selected.append(row)
         selected_keys.add(key)
         head_counts[head] += 1
 
-    ranked_for_string = calculate_scores(racers)
-    string_ranked = sorted(racers, key=lambda r: string_power(r, ranked_for_string), reverse=True)
-    string_targets = []
-    score_sorted = sorted(racers, key=lambda x: x.score, reverse=True)
-    for r in string_ranked:
-        score_rank = score_sorted.index(r) + 1
-        sp = string_power(r, ranked_for_string)
-        if score_rank >= 5 and sp >= 50:
-            string_targets.append(r.lane)
-    for target_lane in string_targets[:2]:
+        if contains_bottom:
+            bottom_use_count += 1
+
+        for lane in mid_lanes:
+            if head == lane or second == lane or third == lane:
+                mid_use_count[lane] = mid_use_count.get(lane, 0) + 1
+
+        return True
+
+    # 1. 頭期待値上位から本線
+    for h in strong_heads[:3]:
         if len(selected) >= total:
             break
-        cand = df[df["買い目"].astype(str).str.endswith(f"-{target_lane}")].sort_values("評価", ascending=False)
+        cand = df[df["頭"] == h].sort_values("評価", ascending=False)
         for _, row in cand.iterrows():
-            key = row["買い目"]
-            if key in selected_keys:
-                continue
-            selected.append(row)
-            selected_keys.add(key)
+            if add_row(row):
+                break
+
+    # 2. 指数3位・4位を必ず最低1点ずつ残す
+    for lane in mid_lanes:
+        if len(selected) >= total:
             break
 
-    # v10.9 相手期待値AI：
-    # 頭候補 × 相手候補で、指数下位でも相手期待値が高い艇を2着/3着へ強制追加。
-    head_ranked_now = calculate_head_power(racers)
-    place_ranked_now = calculate_place_power(racers)
-    third_ranked_now = calculate_third_power(racers)
+        cand = df[
+            (df["頭"] == lane) | (df["2着"] == lane) | (df["3着"] == lane)
+        ].sort_values("評価", ascending=False)
 
-    strong_heads = [r.lane for r in head_ranked_now if r.head_power >= 70]
-    if not strong_heads:
-        strong_heads = [head_ranked_now[0].lane]
+        for _, row in cand.iterrows():
+            if add_row(row):
+                break
 
-    place_targets = [r.lane for r in place_ranked_now if r.place_power >= 62]
-    third_targets = [r.lane for r in third_ranked_now if r.third_power >= 62]
-
-    # 2着に相手期待値上位を入れる
+    # 3. 相手期待値上位を2着候補として追加
     for h in strong_heads[:2]:
         if len(selected) >= total:
             break
-        for p in place_targets[:3]:
+        for p in place_targets[:4]:
             if len(selected) >= total:
                 break
             if p == h:
                 continue
 
             cand = df[
-                df["買い目"].astype(str).str.startswith(f"{h}-{p}-")
+                (df["頭"] == h) & (df["2着"] == p)
             ].sort_values("評価", ascending=False)
 
             for _, row in cand.iterrows():
-                key = row["買い目"]
-                if key in selected_keys:
-                    continue
-                selected.append(row)
-                selected_keys.add(key)
-                break
+                if add_row(row):
+                    break
 
-    # 3着に3着期待値上位を入れる
-    for t in third_targets[:3]:
+    # 4. 3着期待値上位を3着候補として追加
+    for t in third_targets[:4]:
         if len(selected) >= total:
             break
 
-        cand = df[
-            df["買い目"].astype(str).str.endswith(f"-{t}")
-        ].sort_values("評価", ascending=False)
-
+        cand = df[df["3着"] == t].sort_values("評価", ascending=False)
         for _, row in cand.iterrows():
-            key = row["買い目"]
-            if key in selected_keys:
-                continue
-            selected.append(row)
-            selected_keys.add(key)
-            break
+            if add_row(row):
+                break
 
-    out = pd.DataFrame(selected).drop(columns=["頭"], errors="ignore").reset_index(drop=True)
+    # 5. 足りない分は高評価順で補完
+    for _, row in df.sort_values("評価", ascending=False).iterrows():
+        if len(selected) >= total:
+            break
+        add_row(row)
+
+    # 6. それでも足りない場合のみ、最下位制限を緩める
+    for _, row in df.sort_values("評価", ascending=False).iterrows():
+        if len(selected) >= total:
+            break
+        add_row(row, allow_extra_bottom=True)
+
+    out = pd.DataFrame(selected).drop(columns=["頭", "2着", "3着"], errors="ignore").reset_index(drop=True)
+
     labels = []
     for i, row in out.iterrows():
         if i < 2:
@@ -1049,9 +1051,9 @@ def balance_predictions(df: pd.DataFrame, racers: List[Racer], tactic: Dict, pic
             labels.append("抑え")
         else:
             labels.append("穴")
+
     out["区分"] = labels
     return out
-
 
 def generate_predictions(racers: List[Racer], odds: Dict[str, float], pick_count: int = 10, preset: str = "標準") -> pd.DataFrame:
     calculate_scores(racers)
@@ -1085,7 +1087,7 @@ def generate_predictions(racers: List[Racer], odds: Dict[str, float], pick_count
     elif grade == "穴期待":
         auto_count = 10
     else:
-        auto_count = max(3, min(pick_count, 5))
+        auto_count = max(4, min(pick_count, 6))
 
     if preset == "攻め":
         effective_count = min(max(pick_count, auto_count), 20)
@@ -1434,7 +1436,7 @@ def main():
     use_odds = st.sidebar.checkbox("オッズ取得を試す", value=False)
     preset = st.sidebar.radio("買い目プリセット", ["的中率重視", "標準", "攻め"], index=0)
     if preset == "的中率重視":
-        default_count = 4
+        default_count = 5
     elif preset == "標準":
         default_count = 10
     else:
